@@ -18,4 +18,8 @@ __pycache__/
 .idea/
 
 .DS_Store
-Thumbs.db
+Thumbs.dbfrontend/tsconfig.tsbuildinfo
+security/liboqs/
+security/__pycache__/
+*.pyc
+frontend/tsconfig.tsbuildinfo

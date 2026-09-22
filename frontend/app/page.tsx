@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 
 import {
   Activity,
@@ -23,7 +23,6 @@ import {
   Play,
   Pause,
   RotateCcw,
-  Radio,
   History,
   Zap,
 } from "lucide-react";
@@ -166,6 +165,181 @@ type ReplayState = {
 
 const API_BASE_URL = "http://127.0.0.1:8001";
 
+type ChartRangeKey =
+  | "5m"
+  | "15m"
+  | "30m"
+  | "1h"
+  | "6h"
+  | "12h"
+  | "24h"
+  | "all";
+
+
+/* =========================================================
+   LOCAL ENGINE SIMULATION FALLBACK
+   ========================================================= */
+
+function generateLocalSimulation(
+  faultMode: string,
+  missionAltitude = 4500,
+  missionTemperature = 32,
+  missionThrottle = 70,
+  missionDuration = 20,
+  missionType = "ISR",
+  timeMs = Date.now()
+): PipelineData {
+  const t = timeMs / 1000;
+  const wave = (speed: number, amplitude: number) =>
+    Math.sin(t * speed) * amplitude;
+  const noise = (amplitude: number) =>
+    wave(1.7, amplitude) + wave(0.63, amplitude * 0.45);
+
+  const mode = faultMode.toLowerCase();
+  const baseThrottle = 72 + wave(0.18, 7);
+  const throttle = Math.max(45, Math.min(95, baseThrottle));
+  const load = throttle / 100;
+
+  let rpm = 2050 + load * 650 + noise(35);
+  let egt = 575 + load * 170 + noise(7);
+  let cht = 125 + load * 38 + noise(2.5);
+  let oilPressure = 2.8 + (rpm / 3000) * 2.0 + noise(0.06);
+  let oilTemperature = 72 + load * 27 + noise(1.2);
+  let vibration = 1.3 + load * 0.9 + Math.abs(noise(0.18));
+  let fuelFlow = 12 + load * 10 + noise(0.3);
+
+  if (mode === "overheating") {
+    egt += 110 + wave(0.7, 12);
+    cht += 42;
+    oilTemperature += 28;
+    rpm -= 80;
+  } else if (mode === "low_oil") {
+    oilPressure = 1.55 + Math.abs(wave(0.8, 0.28));
+    oilTemperature += 18;
+    vibration += 0.7;
+  } else if (mode === "high_vibration") {
+    vibration = 5.0 + Math.abs(wave(1.9, 1.5));
+    rpm += wave(2.4, 70);
+  } else if (mode === "misfire") {
+    const pulse = Math.sin(t * 5.2);
+    rpm -= pulse > 0 ? 260 : 20;
+    egt += pulse > 0 ? 65 : 5;
+    vibration += pulse > 0 ? 1.8 : 0.2;
+    fuelFlow -= pulse > 0 ? 2.0 : 0;
+  } else if (mode === "injector") {
+    egt += 75;
+    fuelFlow += 5.5 + Math.abs(wave(1.2, 1.5));
+    rpm -= 120;
+    vibration += 0.6;
+  }
+
+  rpm = Math.max(1200, Math.min(2900, rpm));
+  egt = Math.max(450, egt);
+  cht = Math.max(90, cht);
+  oilPressure = Math.max(0.5, oilPressure);
+  oilTemperature = Math.max(55, oilTemperature);
+  vibration = Math.max(0.5, vibration);
+  fuelFlow = Math.max(5, fuelFlow);
+
+  let health = 100;
+  if (egt > 800) health -= 30;
+  else if (egt > 750) health -= 20;
+  else if (egt > 720) health -= 10;
+  if (cht > 190) health -= 25;
+  else if (cht > 175) health -= 15;
+  if (oilPressure < 2) health -= 30;
+  else if (oilPressure < 3) health -= 15;
+  if (vibration > 6) health -= 25;
+  else if (vibration > 4) health -= 15;
+  if (mode === "misfire") health -= 12;
+  if (mode === "injector") health -= 10;
+  health = Math.max(15, Math.min(100, health + wave(0.23, 1.5)));
+
+  let fault = "NO SIGNIFICANT FAULT";
+  let severity = "LOW";
+  if (mode === "overheating") { fault = "POSSIBLE OVERHEATING"; severity = health < 70 ? "CRITICAL" : "HIGH"; }
+  else if (mode === "low_oil") { fault = "POSSIBLE LUBRICATION PROBLEM"; severity = "HIGH"; }
+  else if (mode === "high_vibration") { fault = "POSSIBLE MECHANICAL/VIBRATION PROBLEM"; severity = "HIGH"; }
+  else if (mode === "misfire") { fault = "POSSIBLE MISFIRE"; severity = "HIGH"; }
+  else if (mode === "injector") { fault = "POSSIBLE INJECTOR PROBLEM"; severity = "HIGH"; }
+
+  const healthRounded = Math.round(health);
+  const status = healthRounded >= 85 ? "NORMAL" : healthRounded >= 70 ? "WARNING" : healthRounded >= 50 ? "CRITICAL" : "DANGER";
+  const healthSeverity = healthRounded >= 85 ? "LOW" : healthRounded >= 70 ? "MEDIUM" : "HIGH";
+
+  let rulMin = healthRounded >= 90 ? 80 : healthRounded >= 75 ? 60 : healthRounded >= 60 ? 40 : healthRounded >= 40 ? 20 : 5;
+  let rulMax = healthRounded >= 90 ? 120 : healthRounded >= 75 ? 90 : healthRounded >= 60 ? 65 : healthRounded >= 40 ? 40 : 20;
+  if (severity === "CRITICAL") { rulMin = Math.max(1, rulMin - 8); rulMax = Math.max(2, rulMax - 15); }
+  else if (severity === "HIGH") { rulMin = Math.max(1, rulMin - 6); rulMax = Math.max(2, rulMax - 10); }
+  const rulStatus = rulMax > 60 ? "HEALTHY" : rulMax > 30 ? "MONITOR" : rulMax > 10 ? "MAINTENANCE REQUIRED" : "URGENT INSPECTION";
+
+  let risk = 8 + (100 - healthRounded) * 0.55;
+  if (mode !== "normal") risk += 18;
+  risk += Math.max(0, missionAltitude - 5000) / 1000 * 5;
+  risk += Math.max(0, missionTemperature - 35) * 1.5;
+  risk += Math.max(0, missionThrottle - 80) * 0.7;
+  risk += Math.max(0, missionDuration - 30) * 0.35;
+  risk = Math.max(0, Math.min(100, risk));
+  const riskScore = Math.round(risk);
+  const riskLevel = riskScore >= 75 ? "CRITICAL" : riskScore >= 55 ? "HIGH" : riskScore >= 30 ? "MEDIUM" : "LOW";
+  const decision = riskLevel === "CRITICAL" ? "MISSION NOT RECOMMENDED" : riskLevel === "HIGH" ? "MISSION REVIEW REQUIRED" : riskLevel === "MEDIUM" ? "PROCEED WITH CAUTION" : "MISSION ACCEPTABLE";
+
+  const now = new Date(timeMs).toISOString();
+  return {
+    engine_data: {
+      timestamp: now, rpm, egt, cht, oil_pressure: oilPressure,
+      oil_temperature: oilTemperature, vibration, fuel_flow: fuelFlow, throttle,
+    },
+    health: {
+      health: healthRounded, health_score: healthRounded, status,
+      severity: healthSeverity,
+      reason: mode === "normal" ? "Simulated engine parameters are within the normal operating range." : `Simulation is injecting ${faultMode} conditions into the engine model.`,
+      recommendation: mode === "normal" ? "Continue normal monitoring." : "Investigate the detected condition and plan maintenance.",
+    },
+    fault: {
+      fault, confidence: mode === "normal" ? 95 : 90, severity,
+      evidence: mode === "normal" ? ["Engine parameters stable"] : [`${faultMode} condition simulated`],
+      recommendation: mode === "normal" ? "Continue monitoring." : "Inspect the affected engine system.",
+    },
+    rul: {
+      rul_min_hours: rulMin, rul_max_hours: rulMax, confidence: 82,
+      status: rulStatus,
+      reason: mode === "normal" ? "Stable simulated engine condition." : `RUL reduced for the simulated ${faultMode} condition.`,
+      recommendation: rulMax > 30 ? "Plan preventive inspection." : "Perform engine inspection before the next mission.",
+    },
+    mission_risk: {
+      risk_score: riskScore, risk_level: riskLevel,
+      risk_factors: ["Altitude", "Ambient temperature", "Throttle", "Mission duration", "Engine condition"],
+      decision,
+      recommendation: decision,
+      mission_profile: { mission_type: missionType, altitude: missionAltitude, ambient_temperature: missionTemperature, throttle: missionThrottle, mission_duration: missionDuration },
+      engine_condition: { health: healthRounded, fault, fault_severity: severity, rul_min_hours: rulMin, rul_max_hours: rulMax },
+    },
+    anomaly: {
+      status: "SIMULATED", anomaly: mode !== "normal", anomaly_score: mode === "normal" ? 0.08 : 0.82,
+      confidence: 88, severity: mode === "normal" ? "LOW" : "HIGH",
+      message: mode === "normal" ? "No simulated anomaly detected." : `Simulated ${faultMode} anomaly detected.`,
+      samples_analyzed: 1,
+    },
+  };
+}
+
+const CHART_RANGES: Array<{
+  key: ChartRangeKey;
+  label: string;
+  minutes: number | null;
+  historyLimit: number;
+}> = [
+  { key: "5m", label: "Last 5 min", minutes: 5, historyLimit: 300 },
+  { key: "15m", label: "Last 15 min", minutes: 15, historyLimit: 600 },
+  { key: "30m", label: "Last 30 min", minutes: 30, historyLimit: 1200 },
+  { key: "1h", label: "Last 1 hour", minutes: 60, historyLimit: 2500 },
+  { key: "6h", label: "Last 6 hours", minutes: 360, historyLimit: 12000 },
+  { key: "12h", label: "Last 12 hours", minutes: 720, historyLimit: 24000 },
+  { key: "24h", label: "Last 24 hours", minutes: 1440, historyLimit: 50000 },
+  { key: "all", label: "All available", minutes: null, historyLimit: 50000 },
+];
+
 /* =========================================================
    MAIN PAGE
    ========================================================= */
@@ -193,7 +367,21 @@ export default function HomePage() {
   const [lastUpdate, setLastUpdate] =
     useState("--:--:--");
 
-      /* =========================================================
+  const [chartRange, setChartRange] =
+    useState<ChartRangeKey>("15m");
+
+  const selectedChartRange =
+    CHART_RANGES.find((range) => range.key === chartRange) ??
+    CHART_RANGES[0];
+
+  const historyRefreshMs =
+    selectedChartRange.minutes !== null && selectedChartRange.minutes <= 60
+      ? 5000
+      : selectedChartRange.minutes === 360
+        ? 15000
+        : 60000;
+
+  /* =========================================================
      MISSION SCENARIO CONTROLS
      ========================================================= */
 
@@ -245,8 +433,36 @@ export default function HomePage() {
   const replayTimerRef =
     useRef<NodeJS.Timeout | null>(null);
 
+  /* =========================================================
+     WARNING ALARM + SCREEN SHAKE
+     ========================================================= */
 
-      /* =========================================================
+  const [alarmMuted, setAlarmMuted] =
+    useState(false);
+
+  const [shakeActive, setShakeActive] =
+    useState(false);
+
+  const alarmContextRef =
+    useRef<AudioContext | null>(null);
+
+  const alarmIntervalRef =
+    useRef<number | null>(null);
+
+  const previousDangerRef =
+    useRef(false);
+
+  const shakeTimerRef =
+    useRef<NodeJS.Timeout | null>(null);
+
+  const shakeIntervalRef =
+    useRef<number | null>(null);
+
+  const [alertAcknowledged, setAlertAcknowledged] =
+    useState(false);
+
+
+  /* =========================================================
      RUN MISSION SCENARIO
      ========================================================= */
 
@@ -292,7 +508,6 @@ export default function HomePage() {
         await response.json();
 
       setMissionResult(data);
-
       setPipelineData(data);
 
       setEngineData(
@@ -312,9 +527,7 @@ export default function HomePage() {
       setMissionMessage(
         "Mission scenario completed successfully."
       );
-
     } catch (error) {
-
       console.error(
         "Mission scenario error:",
         error
@@ -323,12 +536,11 @@ export default function HomePage() {
       setMissionMessage(
         "Unable to run mission scenario. Check the backend."
       );
-
     } finally {
-
       setMissionLoading(false);
     }
   };
+
   /* =========================================================
      BACKEND CONNECTION
      ========================================================= */
@@ -372,21 +584,53 @@ export default function HomePage() {
           })
         );
       } catch (error) {
-        console.error(
-          "Backend connection error:",
-          error
-        );
+        console.warn("Backend unavailable; running local engine simulation.", error);
 
         if (!isMounted) return;
 
-        setConnected(false);
+        const simulated = generateLocalSimulation(
+          selectedFault,
+          missionAltitude,
+          missionTemperature,
+          missionThrottle,
+          missionDuration,
+          missionType
+        );
+        setPipelineData(simulated);
+        setEngineData(simulated.engine_data ?? null);
+        setConnected(true);
+        setLastUpdate(
+          new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          })
+        );
+
+        setTelemetryHistory((previous) => {
+          const d = simulated.engine_data!;
+          const point: TelemetryHistory = {
+            id: Date.now(),
+            timestamp: d.timestamp ?? new Date().toISOString(),
+            rpm: d.rpm ?? 0,
+            egt: d.egt ?? 0,
+            cht: d.cht ?? 0,
+            oil_pressure: d.oil_pressure ?? 0,
+            oil_temperature: d.oil_temperature ?? 0,
+            vibration: d.vibration ?? 0,
+            fuel_flow: d.fuel_flow ?? 0,
+            throttle: d.throttle ?? 0,
+            fault_mode: selectedFault,
+          };
+          return [...previous, point].slice(-900);
+        });
       }
     };
 
     const fetchTelemetryHistory = async () => {
       try {
         const response = await fetch(
-          `${API_BASE_URL}/engine/history?limit=50`,
+          `${API_BASE_URL}/engine/history?limit=${selectedChartRange.historyLimit}`,
           {
             cache: "no-store",
           }
@@ -460,7 +704,7 @@ export default function HomePage() {
     const historyInterval =
       setInterval(
         fetchTelemetryHistory,
-        5000
+        historyRefreshMs
       );
 
     return () => {
@@ -474,7 +718,84 @@ export default function HomePage() {
         historyInterval
       );
     };
-  }, [selectedFault]);
+  }, [
+    selectedFault,
+    chartRange,
+    selectedChartRange.historyLimit,
+    historyRefreshMs,
+    missionAltitude,
+    missionDuration,
+    missionTemperature,
+    missionThrottle,
+    missionType,
+  ]);
+
+  /* =========================================================
+     CHART TIME WINDOW
+     ========================================================= */
+
+  const chartData = useMemo(() => {
+    const now = telemetryHistory.length
+      ? Date.parse(telemetryHistory[telemetryHistory.length - 1].timestamp)
+      : 0;
+    const windowStart =
+      selectedChartRange.minutes === null
+        ? 0
+        : now - selectedChartRange.minutes * 60 * 1000;
+
+    const filtered = telemetryHistory.filter((point) => {
+      const timestamp = Date.parse(point.timestamp);
+      return Number.isFinite(timestamp) && timestamp >= windowStart;
+    });
+
+    // Keep the raw history intact, but downsample very large windows
+    // so Recharts stays smooth on the dashboard.
+    const maxChartPoints = 900;
+    const step =
+      filtered.length > maxChartPoints
+        ? Math.ceil(filtered.length / maxChartPoints)
+        : 1;
+
+    return filtered
+      .filter((_, index) => index % step === 0)
+      .map((point) => ({
+        time:
+          selectedChartRange.minutes !== null &&
+          selectedChartRange.minutes <= 60
+            ? new Date(point.timestamp).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+              })
+            : new Date(point.timestamp).toLocaleString([], {
+                month: "short",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+        timestamp: point.timestamp,
+        rpm: point.rpm,
+        egt: point.egt,
+        cht: point.cht,
+        oil_pressure: point.oil_pressure,
+        oil_temperature: point.oil_temperature,
+        vibration: point.vibration,
+        fuel_flow: point.fuel_flow,
+        throttle: point.throttle,
+      }));
+  }, [telemetryHistory, selectedChartRange]);
+
+  const availableHistoryMinutes = useMemo(() => {
+    if (telemetryHistory.length < 2) return 0;
+
+    const timestamps = telemetryHistory
+      .map((point) => Date.parse(point.timestamp))
+      .filter(Number.isFinite);
+
+    if (timestamps.length < 2) return 0;
+
+    return Math.max(0, (Math.max(...timestamps) - Math.min(...timestamps)) / 60000);
+  }, [telemetryHistory]);
 
   /* =========================================================
      MISSION REPLAY TIMER
@@ -493,20 +814,18 @@ export default function HomePage() {
       return;
     }
 
-    if (
-      replayIndex >=
-      replayData.length - 1
-    ) {
-      setIsReplayPlaying(false);
+    if (replayIndex >= replayData.length - 1) {
       return;
     }
 
     replayTimerRef.current =
       setTimeout(() => {
         setReplayIndex(
-          (previous) =>
-            previous + 1
+          (previous) => previous + 1
         );
+        if (replayIndex + 1 >= replayData.length - 1) {
+          setIsReplayPlaying(false);
+        }
       }, 1000 / replaySpeed);
 
     return () => {
@@ -729,7 +1048,7 @@ export default function HomePage() {
 
   const faultName =
     activeFault?.fault ??
-    "NO FAULT DETECTED";
+    "NO SIGNIFICANT FAULT";
 
   const faultSeverity =
     activeFault?.severity ??
@@ -746,210 +1065,475 @@ export default function HomePage() {
     activeMissionRisk?.decision ??
     "WAITING FOR ASSESSMENT";
 
+  const replayChartData = useMemo(() => {
+    const now = replayData.length
+      ? Date.parse(replayData[replayData.length - 1].timestamp)
+      : 0;
+    const windowStart =
+      selectedChartRange.minutes === null
+        ? 0
+        : now - selectedChartRange.minutes * 60 * 1000;
+
+    return replayData
+      .filter((entry) => {
+        const timestamp = Date.parse(entry.timestamp);
+        return Number.isFinite(timestamp) && timestamp >= windowStart;
+      })
+      .map((entry) => {
+        const timestamp = Date.parse(entry.timestamp);
+        return {
+          timestamp,
+          time:
+            selectedChartRange.minutes !== null &&
+            selectedChartRange.minutes <= 60
+              ? new Date(timestamp).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  second: "2-digit",
+                })
+              : new Date(timestamp).toLocaleString([], {
+                  month: "short",
+                  day: "numeric",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+          health:
+            entry.health?.health ??
+            entry.health?.health_score ??
+            0,
+          risk:
+            entry.mission_risk?.risk_score ??
+            0,
+        };
+      });
+  }, [replayData, selectedChartRange]);
+
+  const twinHealth =
+    healthScore !== undefined ? healthScore : 0;
+
   /* =========================================================
-     AI ANOMALY DATA
+     ENGINE ALERT / FAULT STATE
      ========================================================= */
 
+  const detectedFault =
+    faultName.toUpperCase();
+
+  const detectedSeverity =
+    faultSeverity.toUpperCase();
+
+  const detectedRisk =
+    riskLevel.toUpperCase();
+
+  const hasFault =
+    detectedFault !==
+      "NO SIGNIFICANT FAULT" &&
+    detectedFault !==
+      "NO FAULT DETECTED" &&
+    detectedFault !== "NONE";
+
+  /*
+     Any detected engine fault is treated as a red
+     dashboard alert for the prototype demonstration.
+  */
+
+  const dangerState =
+    hasFault ||
+    detectedSeverity === "CRITICAL" ||
+    detectedSeverity === "HIGH" ||
+    detectedRisk === "CRITICAL" ||
+    detectedRisk === "HIGH";
+
+  const warningState =
+    !dangerState &&
+    (
+      detectedSeverity === "MEDIUM" ||
+      detectedRisk === "MEDIUM"
+    );
+
+  const twinState = dangerState
+    ? "CRITICAL"
+    : warningState
+      ? "WARNING"
+      : "STABLE";
+
   const anomalyDetected =
-    pipelineData?.anomaly?.anomaly ??
-    false;
+    Boolean(pipelineData?.anomaly?.anomaly) ||
+    Boolean(
+      activeFault &&
+        faultName !== "NO SIGNIFICANT FAULT" &&
+        faultName !== "NO FAULT DETECTED" &&
+        faultName !== "NONE"
+    ) ||
+    (typeof (pipelineData?.anomaly?.anomaly_score ?? 0) === "number" &&
+      (pipelineData?.anomaly?.anomaly_score ?? 0) > 0);
 
   const anomalyStatus =
     pipelineData?.anomaly?.status ??
-    "WAITING";
+    (anomalyDetected ? "ALERT" : "NORMAL");
 
   const anomalyScore =
-    pipelineData?.anomaly?.anomaly_score ??
-    0;
+    pipelineData?.anomaly?.anomaly_score ?? 0;
 
   const anomalyConfidence =
-    pipelineData?.anomaly?.confidence ??
-    0;
+    pipelineData?.anomaly?.confidence ?? 0;
 
   const anomalySeverity =
-    pipelineData?.anomaly?.severity ??
-    "LOW";
+    pipelineData?.anomaly?.severity ?? "LOW";
 
   const anomalyMessage =
     pipelineData?.anomaly?.message ??
-    "AI anomaly detector is waiting for telemetry.";
+    "Engine behaviour is consistent with normal operating parameters.";
 
   const anomalySamples =
-    pipelineData?.anomaly?.samples_analyzed ??
-    0;
+    pipelineData?.anomaly?.samples_analyzed ?? 0;
 
-  /* =========================================================
-     DIGITAL TWIN STATE
-     ========================================================= */
+  let dashboardAlertTitle =
+    "ENGINE STATUS: STABLE";
 
-  const twinHealth =
-    healthScore !== undefined
-      ? Math.round(healthScore)
-      : 0;
-
-  let twinState = "NORMAL";
-
-  const activeFaultMode =
-    replayMode && currentReplay
-      ? currentReplay.fault_mode
-      : selectedFault;
+  let dashboardAlertMessage =
+    "No abnormal condition detected. Aircraft engine is operating normally.";
 
   if (
-    activeFaultMode ===
-      "overheating" ||
-    activeFaultMode ===
-      "low_oil" ||
-    activeFaultMode ===
-      "misfire"
+    detectedFault ===
+    "POSSIBLE OVERHEATING"
   ) {
-    twinState = "WARNING";
-  }
+    dashboardAlertTitle =
+      "⚠ ENGINE ALERT: OVERHEATING";
 
-  if (
-    activeFaultMode ===
-      "high_vibration" ||
-    activeFaultMode ===
-      "injector"
+    dashboardAlertMessage =
+      "EGT and CHT are above the safe operating range. Immediate inspection is recommended.";
+  } else if (
+    detectedFault ===
+    "POSSIBLE LUBRICATION PROBLEM"
   ) {
-    twinState = "ATTENTION";
-  }
+    dashboardAlertTitle =
+      "⚠ ENGINE ALERT: LOW OIL PRESSURE";
 
-  if (twinHealth < 50) {
-    twinState = "CRITICAL";
-  }
-
-  /* =========================================================
-     PREDICTION MESSAGE
-     ========================================================= */
-
-  let predictionMessage =
-    "Engine telemetry is being monitored continuously.";
-
-  if (
-    activeFaultMode ===
-    "normal"
+    dashboardAlertMessage =
+      "Oil pressure is below the expected operating range. Possible lubrication problem detected.";
+  } else if (
+    detectedFault ===
+    "POSSIBLE MECHANICAL/VIBRATION PROBLEM"
   ) {
-    predictionMessage =
-      "All monitored engine parameters are currently within the expected prototype operating range.";
-  }
+    dashboardAlertTitle =
+      "⚠ ENGINE ALERT: ABNORMAL VIBRATION";
 
-  if (
-    activeFaultMode ===
-    "overheating"
+    dashboardAlertMessage =
+      "Engine vibration is significantly above the normal range. Mechanical inspection is recommended.";
+  } else if (
+    detectedFault ===
+    "POSSIBLE MISFIRE"
   ) {
-    predictionMessage =
-      "Elevated thermal behaviour detected. Monitor EGT and CHT closely.";
-  }
+    dashboardAlertTitle =
+      "⚠ ENGINE ALERT: POSSIBLE MISFIRE";
 
-  if (
-    activeFaultMode ===
-    "low_oil"
+    dashboardAlertMessage =
+      "Abnormal RPM, EGT and vibration patterns indicate a possible combustion problem.";
+  } else if (
+    detectedFault ===
+    "POSSIBLE INJECTOR PROBLEM"
   ) {
-    predictionMessage =
-      "Low oil-pressure condition detected. Lubrication system requires attention.";
-  }
+    dashboardAlertTitle =
+      "⚠ ENGINE ALERT: POSSIBLE INJECTOR PROBLEM";
 
-  if (
-    activeFaultMode ===
-    "high_vibration"
-  ) {
-    predictionMessage =
-      "Abnormal vibration detected. Mechanical condition should be inspected.";
-  }
+    dashboardAlertMessage =
+      "Fuel-flow and engine-temperature patterns indicate a possible injector abnormality.";
+  } else if (dangerState) {
+    dashboardAlertTitle =
+      "⚠ ENGINE ALERT";
 
-  if (
-    activeFaultMode ===
-    "misfire"
-  ) {
-    predictionMessage =
-      "Combustion irregularity detected. Engine performance should be monitored.";
-  }
+    dashboardAlertMessage =
+      activeFault?.recommendation ??
+      activeMissionRisk?.recommendation ??
+      "Engine condition requires immediate attention.";
+  } else if (warningState) {
+    dashboardAlertTitle =
+      "ENGINE STATUS: MONITOR";
 
-  if (
-    activeFaultMode ===
-    "injector"
-  ) {
-    predictionMessage =
-      "Possible injector abnormality detected. Fuel delivery should be inspected.";
+    dashboardAlertMessage =
+      activeFault?.recommendation ??
+      activeMissionRisk?.recommendation ??
+      "Engine condition requires closer monitoring.";
   }
 
   /* =========================================================
-     ALERT
+     WARNING ALARM + EARTHQUAKE WARNING CONTROL
      ========================================================= */
 
-  const alertTitle =
-    activeFaultMode === "normal"
-      ? "No critical alerts"
-      : faultName;
+  const clearShakeTimers = () => {
+    if (shakeTimerRef.current) {
+      clearTimeout(shakeTimerRef.current);
+      shakeTimerRef.current = null;
+    }
 
-  const alertMessage =
-    activeFaultMode === "normal"
-      ? "Engine telemetry is being monitored continuously."
-      : activeFault?.recommendation ??
-        "Inspect engine condition and continue monitoring.";
+    if (shakeIntervalRef.current !== null) {
+      window.clearInterval(shakeIntervalRef.current);
+      shakeIntervalRef.current = null;
+    }
+  };
 
-  /* =========================================================
-     CHART DATA
-     ========================================================= */
+  const stopAlarm = () => {
+    if (alarmIntervalRef.current !== null) {
+      window.clearInterval(
+        alarmIntervalRef.current
+      );
+      alarmIntervalRef.current = null;
+    }
 
-  const chartData =
-    telemetryHistory.map(
-      (item) => ({
-        ...item,
+    if (alarmContextRef.current) {
+      void alarmContextRef.current
+        .suspend()
+        .catch(() => undefined);
+    }
+  };
 
-        time: new Date(
-          item.timestamp
-        ).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        }),
-      })
-    );
+  const startAlarm = () => {
+    if (alarmMuted || typeof window === "undefined") {
+      return;
+    }
 
-  /* =========================================================
-     REPLAY CHART DATA
-     ========================================================= */
+    if (!alarmContextRef.current) {
+      const AudioContextClass =
+        window.AudioContext ||
+        (window as typeof window & {
+          webkitAudioContext?: typeof AudioContext;
+        }).webkitAudioContext;
 
-  const replayChartData =
-    replayData.map(
-      (item, index) => ({
-        index,
+      if (!AudioContextClass) {
+        return;
+      }
 
-        time: new Date(
-          item.timestamp
-        ).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        }),
+      alarmContextRef.current =
+        new AudioContextClass();
+    }
 
-        rpm:
-          item.engine_data.rpm ?? 0,
+    const audioContext =
+      alarmContextRef.current;
 
-        egt:
-          item.engine_data.egt ?? 0,
+    const playPoliceSiren = () => {
+      try {
+        if (audioContext.state === "suspended") {
+          void audioContext.resume();
+        }
 
-        cht:
-          item.engine_data.cht ?? 0,
+        const now = audioContext.currentTime;
+        const oscillator =
+          audioContext.createOscillator();
+        const gain =
+          audioContext.createGain();
 
-        health:
-          item.health.health ??
-          item.health.health_score ??
-          0,
+        // Police-siren style: "vuy-vuy-vuy"
+        // Three rising/falling sweeps over 3 seconds.
+        oscillator.type = "sawtooth";
+        oscillator.frequency.setValueAtTime(
+          520,
+          now
+        );
 
-        risk:
-          item.mission_risk.risk_score ??
-          0,
-      })
-    );
+        oscillator.frequency.linearRampToValueAtTime(
+          1050,
+          now + 0.5
+        );
+        oscillator.frequency.linearRampToValueAtTime(
+          520,
+          now + 1.0
+        );
+        oscillator.frequency.linearRampToValueAtTime(
+          1050,
+          now + 1.5
+        );
+        oscillator.frequency.linearRampToValueAtTime(
+          520,
+          now + 2.0
+        );
+        oscillator.frequency.linearRampToValueAtTime(
+          1050,
+          now + 2.5
+        );
+        oscillator.frequency.linearRampToValueAtTime(
+          520,
+          now + 3.0
+        );
+
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.linearRampToValueAtTime(
+          0.22,
+          now + 0.08
+        );
+        gain.gain.setValueAtTime(
+          0.22,
+          now + 2.75
+        );
+        gain.gain.exponentialRampToValueAtTime(
+          0.0001,
+          now + 3.0
+        );
+
+        oscillator.connect(gain);
+        gain.connect(audioContext.destination);
+
+        oscillator.start(now);
+        oscillator.stop(now + 3.05);
+      } catch (error) {
+        console.warn(
+          "Warning siren could not play:",
+          error
+        );
+      }
+    };
+
+    if (alarmIntervalRef.current !== null) {
+      return;
+    }
+
+    // 3 seconds siren + 3 seconds silent gap.
+    playPoliceSiren();
+
+    alarmIntervalRef.current =
+      window.setInterval(
+        playPoliceSiren,
+        6000
+      );
+  };
+
+  const startEarthquakeShake = () => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    clearShakeTimers();
+
+    const shakeForThreeSeconds = () => {
+      setShakeActive(true);
+
+      if (shakeTimerRef.current) {
+        clearTimeout(shakeTimerRef.current);
+      }
+
+      // Shake for exactly 3 seconds, then stop
+      // for 3 seconds before the next shake cycle.
+      shakeTimerRef.current =
+        setTimeout(() => {
+          setShakeActive(false);
+        }, 3000);
+    };
+
+    // Start immediately when the red condition appears.
+    shakeForThreeSeconds();
+
+    // Repeat: 3 sec shake + 3 sec gap.
+    shakeIntervalRef.current =
+      window.setInterval(
+        shakeForThreeSeconds,
+        6000
+      );
+  };
+
+  const stopEarthquakeShake = () => {
+    clearShakeTimers();
+    setShakeActive(false);
+  };
+
+  /*
+     Serious/red fault:
+     - 3 sec earthquake-style screen shake
+     - 3 sec gap
+     - repeat while red state remains active
+     - 3 sec police-style "vuy-vuy-vuy" siren
+     - 3 sec silent gap
+     - repeat while red state remains active
+  */
+  useEffect(() => {
+    const wasDanger =
+      previousDangerRef.current;
+
+    /*
+       A new red condition starts a fresh warning cycle.
+       Once the operator acknowledges it, the red indicator
+       remains visible but the alarm and shaking stay stopped
+       until the engine returns to normal.
+    */
+    if (dangerState && !wasDanger) {
+      setTimeout(() => setAlertAcknowledged(false), 0);
+      startEarthquakeShake();
+    }
+
+    if (dangerState && !alarmMuted && !alertAcknowledged) {
+      startAlarm();
+    } else {
+      stopAlarm();
+    }
+
+    if (!dangerState) {
+      setTimeout(() => setAlertAcknowledged(false), 0);
+      setTimeout(stopEarthquakeShake, 0);
+    }
+
+    if (dangerState && alertAcknowledged) {
+      setTimeout(stopEarthquakeShake, 0);
+    }
+
+    previousDangerRef.current =
+      dangerState;
+  }, [dangerState, alarmMuted, alertAcknowledged]);
+
+  /* Stop alarm and shake timers when the page closes. */
+  useEffect(() => {
+    return () => {
+      stopAlarm();
+      stopEarthquakeShake();
+
+      if (alarmContextRef.current) {
+        void alarmContextRef.current
+          .close()
+          .catch(() => undefined);
+      }
+    };
+  }, []);
 
   /* =========================================================
      RETURN UI
      ========================================================= */
 
   return (
-    <main className="dashboard">
+    <>
+      <style jsx global>{`
+        @keyframes aeropulseEarthquake {
+          0% { transform: translate(0, 0) rotate(0deg); }
+          5% { transform: translate(-9px, 4px) rotate(-0.6deg); }
+          10% { transform: translate(8px, -4px) rotate(0.6deg); }
+          15% { transform: translate(-10px, -3px) rotate(-0.7deg); }
+          20% { transform: translate(9px, 4px) rotate(0.7deg); }
+          25% { transform: translate(-8px, -4px) rotate(-0.6deg); }
+          30% { transform: translate(10px, 3px) rotate(0.6deg); }
+          35% { transform: translate(-9px, -3px) rotate(-0.7deg); }
+          40% { transform: translate(8px, 4px) rotate(0.6deg); }
+          45% { transform: translate(-10px, -4px) rotate(-0.6deg); }
+          50% { transform: translate(9px, 3px) rotate(0.7deg); }
+          55% { transform: translate(-8px, -3px) rotate(-0.6deg); }
+          60% { transform: translate(9px, 4px) rotate(0.6deg); }
+          65% { transform: translate(-9px, -4px) rotate(-0.6deg); }
+          70% { transform: translate(8px, 3px) rotate(0.5deg); }
+          75% { transform: translate(-7px, -3px) rotate(-0.5deg); }
+          80% { transform: translate(6px, 2px) rotate(0.4deg); }
+          85% { transform: translate(-5px, -2px) rotate(-0.3deg); }
+          90% { transform: translate(4px, 1px) rotate(0.2deg); }
+          95% { transform: translate(-2px, -1px) rotate(-0.1deg); }
+          100% { transform: translate(0, 0) rotate(0deg); }
+        }
+
+        .aeropulse-shake {
+          animation: aeropulseEarthquake 3s linear infinite;
+        }
+      `}</style>
+
+      <main
+        className={`dashboard ${
+          shakeActive
+            ? "aeropulse-shake"
+            : ""
+        }`}
+      >
 
       {/* =====================================================
           SIDEBAR
@@ -964,13 +1548,11 @@ export default function HomePage() {
           </div>
 
           <div>
-            <h1>AERO</h1>
-            <span>SENTINEL</span>
+            <h1>AEROPULSE</h1>
+            <span>UAV ENGINE DIGITAL TWIN</span>
           </div>
 
         </div>
-
-        {/* SYSTEM STATUS */}
 
         <div className="system-status">
 
@@ -987,8 +1569,6 @@ export default function HomePage() {
             : "BACKEND OFFLINE"}
 
         </div>
-
-        {/* NAVIGATION */}
 
         <nav className="navigation">
 
@@ -1044,8 +1624,6 @@ export default function HomePage() {
 
         </nav>
 
-        {/* SIDEBAR FOOTER */}
-
         <div className="sidebar-footer">
 
           <ShieldCheck size={18} />
@@ -1092,8 +1670,6 @@ export default function HomePage() {
 
           <div className="header-right">
 
-            {/* CONNECTION */}
-
             <div className="connection">
 
               <span
@@ -1111,8 +1687,6 @@ export default function HomePage() {
                   : "Telemetry Offline"}
 
             </div>
-
-            {/* FAULT SIMULATOR */}
 
             <div className="fault-selector">
 
@@ -1159,7 +1733,49 @@ export default function HomePage() {
 
             </div>
 
-            {/* UAV ID */}
+            <button
+              type="button"
+              onClick={() => {
+                if (alarmMuted) {
+                  setAlarmMuted(false);
+                  if (dangerState) {
+                    startAlarm();
+                  }
+                } else {
+                  setAlarmMuted(true);
+                  stopAlarm();
+                }
+              }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                padding: "8px 11px",
+                borderRadius: 8,
+                border: dangerState
+                  ? "1px solid rgba(255, 70, 70, 0.8)"
+                  : "1px solid #334155",
+                background: dangerState
+                  ? "rgba(120, 0, 0, 0.18)"
+                  : "transparent",
+                color: dangerState
+                  ? "#ff4d4d"
+                  : "inherit",
+                cursor: "pointer",
+                fontSize: 12,
+                fontWeight: 600,
+              }}
+              title={
+                alarmMuted
+                  ? "Enable warning alarm"
+                  : "Mute warning alarm"
+              }
+            >
+              <Bell size={15} />
+              {alarmMuted
+                ? "Alarm Muted"
+                : "Alarm On"}
+            </button>
 
             <div className="uav-id">
 
@@ -1176,6 +1792,133 @@ export default function HomePage() {
           </div>
 
         </header>
+
+        {/* ===================================================
+            ENGINE ALERT BOX
+            =================================================== */}
+
+        <div
+          role={dangerState ? "button" : undefined}
+          tabIndex={dangerState ? 0 : undefined}
+          onClick={
+            dangerState
+              ? () => {
+                  setAlertAcknowledged(true);
+                  stopAlarm();
+                  stopEarthquakeShake();
+                }
+              : undefined
+          }
+          onKeyDown={
+            dangerState
+              ? (event) => {
+                  if (
+                    event.key === "Enter" ||
+                    event.key === " "
+                  ) {
+                    event.preventDefault();
+                    setAlertAcknowledged(true);
+                    stopAlarm();
+                    stopEarthquakeShake();
+                  }
+                }
+              : undefined
+          }
+          style={{
+            marginTop: 18,
+            marginBottom: 18,
+            padding: "14px 18px",
+            borderRadius: 12,
+
+            border: dangerState
+              ? "1px solid rgba(255, 60, 60, 0.9)"
+              : warningState
+              ? "1px solid rgba(255, 170, 0, 0.8)"
+              : "1px solid rgba(80, 220, 140, 0.45)",
+
+            background: dangerState
+              ? "rgba(120, 0, 0, 0.16)"
+              : warningState
+              ? "rgba(120, 80, 0, 0.12)"
+              : "rgba(0, 100, 50, 0.10)",
+
+            boxShadow: dangerState
+              ? "0 0 25px rgba(255, 30, 30, 0.35)"
+              : warningState
+              ? "0 0 18px rgba(255, 170, 0, 0.20)"
+              : "0 0 12px rgba(80, 220, 140, 0.10)",
+            cursor: dangerState ? "pointer" : "default",
+            userSelect: "none",
+          }}
+        >
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+            }}
+          >
+
+            <AlertTriangle
+              size={20}
+              style={{
+                color: dangerState
+                  ? "#ff4d4d"
+                  : warningState
+                  ? "#f59e0b"
+                  : "#22c55e",
+              }}
+            />
+
+            <div>
+
+              <strong
+                style={{
+                  color: dangerState
+                    ? "#ff4d4d"
+                    : warningState
+                    ? "#f59e0b"
+                    : "#22c55e",
+
+                  fontSize: 14,
+                }}
+              >
+                {dashboardAlertTitle}
+              </strong>
+
+              <p
+                style={{
+                  margin: "4px 0 0",
+                  fontSize: 13,
+                  color: "#94a3b8",
+                }}
+              >
+                {dashboardAlertMessage}
+              </p>
+
+              {dangerState && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    fontSize: 12,
+                    fontWeight: 700,
+                    letterSpacing: "0.03em",
+                    color: alertAcknowledged
+                      ? "#fca5a5"
+                      : "#ff4d4d",
+                  }}
+                >
+                  {alertAcknowledged
+                    ? "✓ RED ALERT ACKNOWLEDGED — Alarm and screen warning stopped. Monitoring continues."
+                    : "CLICK THIS RED ALERT TO ACKNOWLEDGE — SIREN AND SCREEN WARNING WILL STOP."}
+                </div>
+              )}
+            </div>
+
+          </div>
+
+        </div>
 
         {/* ===================================================
             REPLAY MODE BANNER
@@ -1325,7 +2068,18 @@ export default function HomePage() {
 
           {/* FAULT */}
 
-          <div className="kpi-card">
+          <div
+            className="kpi-card"
+            style={{
+              border: dangerState
+                ? "1px solid rgba(255, 60, 60, 0.9)"
+                : "1px solid rgba(226, 232, 240, 1)",
+
+              boxShadow: dangerState
+                ? "0 0 20px rgba(255, 30, 30, 0.30)"
+                : "none",
+            }}
+          >
 
             <div className="kpi-header">
 
@@ -1333,7 +2087,14 @@ export default function HomePage() {
                 FAULT CONFIDENCE
               </span>
 
-              <AlertTriangle size={19} />
+              <AlertTriangle
+                size={19}
+                style={{
+                  color: dangerState
+                    ? "#ff4d4d"
+                    : undefined,
+                }}
+              />
 
             </div>
 
@@ -1351,7 +2112,16 @@ export default function HomePage() {
 
             </div>
 
-            <p>
+            <p
+              style={{
+                color: dangerState
+                  ? "#ff4d4d"
+                  : undefined,
+                fontWeight: dangerState
+                  ? 600
+                  : undefined,
+              }}
+            >
               ● {faultName}
             </p>
 
@@ -1359,7 +2129,22 @@ export default function HomePage() {
 
           {/* MISSION RISK */}
 
-          <div className="kpi-card">
+          <div
+            className="kpi-card"
+            style={{
+              border: dangerState
+                ? "1px solid rgba(255, 60, 60, 0.9)"
+                : warningState
+                ? "1px solid rgba(255, 170, 0, 0.8)"
+                : "1px solid rgba(80, 220, 140, 0.4)",
+
+              boxShadow: dangerState
+                ? "0 0 24px rgba(255, 30, 30, 0.45), inset 0 0 15px rgba(255, 30, 30, 0.08)"
+                : warningState
+                ? "0 0 18px rgba(255, 170, 0, 0.25)"
+                : "0 0 12px rgba(80, 220, 140, 0.12)",
+            }}
+          >
 
             <div className="kpi-header">
 
@@ -1367,17 +2152,48 @@ export default function HomePage() {
                 MISSION RISK
               </span>
 
-              <ShieldCheck size={19} />
+              <ShieldCheck
+                size={19}
+                style={{
+                  color: dangerState
+                    ? "#ff4d4d"
+                    : warningState
+                    ? "#f59e0b"
+                    : "#22c55e",
+                }}
+              />
 
             </div>
 
-            <div className="kpi-value">
+            <div
+              className="kpi-value"
+              style={{
+                color: dangerState
+                  ? "#ff4d4d"
+                  : warningState
+                  ? "#f59e0b"
+                  : undefined,
+              }}
+            >
 
               {riskLevel}
 
             </div>
 
-            <p>
+            <p
+              style={{
+                color: dangerState
+                  ? "#ff4d4d"
+                  : warningState
+                  ? "#f59e0b"
+                  : undefined,
+                fontWeight:
+                  dangerState ||
+                  warningState
+                    ? 600
+                    : undefined,
+              }}
+            >
 
               ●{" "}
 
@@ -1444,8 +2260,6 @@ export default function HomePage() {
               }
             />
 
-            {/* DIGITAL TWIN INFORMATION */}
-
             <div className="twin-footer">
 
               <div>
@@ -1454,7 +2268,16 @@ export default function HomePage() {
                   Twin Status
                 </span>
 
-                <strong>
+                <strong
+                  style={{
+                    color:
+                      twinState === "CRITICAL"
+                        ? "#ff4d4d"
+                        : twinState === "WARNING"
+                        ? "#f59e0b"
+                        : undefined,
+                  }}
+                >
                   {twinState}
                 </strong>
 
@@ -1871,8 +2694,6 @@ export default function HomePage() {
 
           </div>
 
-          {/* REPLAY TIMELINE */}
-
           <div
             style={{
               marginBottom: 20,
@@ -1944,8 +2765,6 @@ export default function HomePage() {
             </div>
 
           </div>
-
-          {/* REPLAY METRICS */}
 
           {currentReplay ? (
 
@@ -2192,13 +3011,83 @@ export default function HomePage() {
               </p>
 
               <h3>
-                Engine Telemetry Trends
+                Engine Telemetry Trends — {selectedChartRange.label}
               </h3>
 
             </div>
 
             <Database size={20} />
 
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: 8,
+              marginBottom: 16,
+              padding: "10px 12px",
+              borderRadius: 10,
+              background: "#f8fafc",
+              border: "1px solid #e2e8f0",
+            }}
+          >
+            <Clock3 size={16} style={{ color: "#64748b" }} />
+            <span
+              style={{
+                fontSize: 12,
+                fontWeight: 700,
+                color: "#475569",
+                marginRight: 4,
+              }}
+            >
+              TIME RANGE
+            </span>
+
+            {CHART_RANGES.map((range) => (
+              <button
+                key={range.key}
+                type="button"
+                onClick={() => setChartRange(range.key)}
+                style={{
+                  padding: "7px 11px",
+                  borderRadius: 7,
+                  border:
+                    chartRange === range.key
+                      ? "1px solid #0f172a"
+                      : "1px solid #cbd5e1",
+                  background:
+                    chartRange === range.key
+                      ? "#0f172a"
+                      : "white",
+                  color:
+                    chartRange === range.key
+                      ? "white"
+                      : "#475569",
+                  fontSize: 12,
+                  fontWeight: chartRange === range.key ? 700 : 500,
+                  cursor: "pointer",
+                }}
+              >
+                {range.label}
+              </button>
+            ))}
+
+            <span
+              style={{
+                marginLeft: "auto",
+                fontSize: 11,
+                color: "#64748b",
+              }}
+            >
+              {chartData.length} plotted points
+              {availableHistoryMinutes > 0
+                ? ` • ${availableHistoryMinutes < 60
+                    ? `${Math.round(availableHistoryMinutes)} min available`
+                    : `${(availableHistoryMinutes / 60).toFixed(1)} hr available`}`
+                : ""}
+            </span>
           </div>
 
           {chartData.length > 0 ? (
@@ -2232,6 +3121,7 @@ export default function HomePage() {
 
                   <XAxis
                     dataKey="time"
+                    interval="preserveStartEnd"
                     tick={{
                       fontSize: 11,
                     }}
@@ -2362,9 +3252,14 @@ export default function HomePage() {
                     }}
                   />
 
-                  <YAxis />
+                  <YAxis
+                    domain={[0, 100]}
+                    tick={{ fontSize: 11 }}
+                  />
 
-                  <Tooltip />
+                  <Tooltip
+                    labelFormatter={(label) => `Time: ${label}`}
+                  />
 
                   <Legend />
 
@@ -2795,27 +3690,30 @@ export default function HomePage() {
 
               <div>
 
-                <strong>
+                <strong
+                  style={{
+                    color: dangerState
+                      ? "#ff4d4d"
+                      : undefined,
+                  }}
+                >
 
-                  {activeFaultMode ===
-                  "normal"
-                    ? "Engine operating normally"
-                    : `Potential ${activeFaultMode.replace(
-                        "_",
-                        " "
-                      )} detected`}
+                  {hasFault
+                    ? dashboardAlertTitle.replace(
+                        "⚠ ",
+                        ""
+                      )
+                    : "Engine operating normally"}
 
                 </strong>
 
                 <p>
-                  {predictionMessage}
+                  {dashboardAlertMessage}
                 </p>
 
               </div>
 
             </div>
-
-            {/* RUL INFORMATION */}
 
             <div className="prediction-details">
 
@@ -2874,7 +3772,22 @@ export default function HomePage() {
 
           {/* ALERTS */}
 
-          <div className="panel alert-panel">
+          <div
+            className="panel alert-panel"
+            style={{
+              border: dangerState
+                ? "1px solid rgba(255, 60, 60, 0.9)"
+                : warningState
+                ? "1px solid rgba(255, 170, 0, 0.8)"
+                : undefined,
+
+              boxShadow: dangerState
+                ? "0 0 22px rgba(255, 30, 30, 0.25)"
+                : warningState
+                ? "0 0 15px rgba(255, 170, 0, 0.18)"
+                : undefined,
+            }}
+          >
 
             <div className="panel-header">
 
@@ -2890,7 +3803,16 @@ export default function HomePage() {
 
               </div>
 
-              <Bell size={20} />
+              <Bell
+                size={20}
+                style={{
+                  color: dangerState
+                    ? "#ff4d4d"
+                    : warningState
+                    ? "#f59e0b"
+                    : undefined,
+                }}
+              />
 
             </div>
 
@@ -2898,28 +3820,49 @@ export default function HomePage() {
 
               <span
                 className={`alert-indicator ${
-                  activeFaultMode ===
-                  "normal"
-                    ? "alert-normal"
-                    : "alert-warning"
+                  dangerState ||
+                  warningState
+                    ? "alert-warning"
+                    : "alert-normal"
                 }`}
+                style={{
+                  background:
+                    dangerState
+                      ? "#ff3b3b"
+                      : warningState
+                      ? "#f59e0b"
+                      : "#22c55e",
+
+                  boxShadow:
+                    dangerState
+                      ? "0 0 12px rgba(255, 40, 40, 0.8)"
+                      : warningState
+                      ? "0 0 10px rgba(245, 158, 11, 0.6)"
+                      : "0 0 8px rgba(34, 197, 94, 0.5)",
+                }}
               />
 
               <div>
 
-                <strong>
-                  {alertTitle}
+                <strong
+                  style={{
+                    color: dangerState
+                      ? "#ff4d4d"
+                      : warningState
+                      ? "#f59e0b"
+                      : undefined,
+                  }}
+                >
+                  {dashboardAlertTitle}
                 </strong>
 
                 <p>
-                  {alertMessage}
+                  {dashboardAlertMessage}
                 </p>
 
               </div>
 
             </div>
-
-            {/* FAULT EVIDENCE */}
 
             {activeFault
               ?.evidence &&
@@ -2980,7 +3923,15 @@ export default function HomePage() {
               FAULT SEVERITY
             </span>
 
-            <strong>
+            <strong
+              style={{
+                color: dangerState
+                  ? "#ff4d4d"
+                  : warningState
+                  ? "#f59e0b"
+                  : undefined,
+              }}
+            >
               {faultSeverity}
             </strong>
 
@@ -2992,7 +3943,15 @@ export default function HomePage() {
               MISSION RISK
             </span>
 
-            <strong>
+            <strong
+              style={{
+                color: dangerState
+                  ? "#ff4d4d"
+                  : warningState
+                  ? "#f59e0b"
+                  : undefined,
+              }}
+            >
               {riskLevel}
             </strong>
 
@@ -3014,6 +3973,7 @@ export default function HomePage() {
 
       </section>
 
-    </main>
+      </main>
+    </>
   );
 }

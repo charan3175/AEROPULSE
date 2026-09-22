@@ -33,14 +33,17 @@ export default function SensorOverview() {
   };
 
   useEffect(() => {
-    fetchSensorData();
+    const initialFetch = setTimeout(fetchSensorData, 0);
 
     const interval = setInterval(
       fetchSensorData,
       2000
     );
 
-    return () => clearInterval(interval);
+    return () => {
+      clearTimeout(initialFetch);
+      clearInterval(interval);
+    };
   }, []);
 
   if (loading || !data) {

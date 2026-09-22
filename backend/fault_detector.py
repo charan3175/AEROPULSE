@@ -20,9 +20,9 @@ def detect_fault(data):
 
     faults = []
 
-    # -----------------------------------
+    # =========================================================
     # 1. OVERHEATING
-    # -----------------------------------
+    # =========================================================
 
     overheating_score = 0
     overheating_evidence = []
@@ -74,31 +74,42 @@ def detect_fault(data):
             )
         })
 
-    # -----------------------------------
+    # =========================================================
     # 2. LUBRICATION PROBLEM
-    # -----------------------------------
+    # =========================================================
 
     lubrication_score = 0
     lubrication_evidence = []
 
+    # Critically low oil pressure
     if oil_pressure < 2.0:
         lubrication_score += 2
         lubrication_evidence.append(
             "Oil pressure is critically low"
         )
 
-    elif oil_pressure < 3.0:
+    # Low oil pressure
+    elif oil_pressure < 2.5:
         lubrication_score += 1
         lubrication_evidence.append(
             "Oil pressure is low"
         )
 
+    # Borderline-low pressure combined with elevated oil temperature
+    if oil_pressure < 2.5 and oil_temperature > 95:
+        lubrication_score += 1
+        lubrication_evidence.append(
+            "Low oil pressure combined with elevated oil temperature"
+        )
+
+    # Critically high oil temperature
     if oil_temperature > 120:
         lubrication_score += 2
         lubrication_evidence.append(
             "Oil temperature is critically high"
         )
 
+    # High oil temperature
     elif oil_temperature > 105:
         lubrication_score += 1
         lubrication_evidence.append(
@@ -116,9 +127,9 @@ def detect_fault(data):
             )
         })
 
-    # -----------------------------------
+    # =========================================================
     # 3. ABNORMAL VIBRATION
-    # -----------------------------------
+    # =========================================================
 
     vibration_score = 0
     vibration_evidence = []
@@ -152,9 +163,9 @@ def detect_fault(data):
             )
         })
 
-    # -----------------------------------
+    # =========================================================
     # 4. MISFIRE
-    # -----------------------------------
+    # =========================================================
 
     misfire_score = 0
     misfire_evidence = []
@@ -194,9 +205,9 @@ def detect_fault(data):
             )
         })
 
-    # -----------------------------------
+    # =========================================================
     # 5. INJECTOR PROBLEM
-    # -----------------------------------
+    # =========================================================
 
     injector_score = 0
     injector_evidence = []
@@ -229,9 +240,9 @@ def detect_fault(data):
             )
         })
 
-    # -----------------------------------
+    # =========================================================
     # 6. SENSOR ANOMALY
-    # -----------------------------------
+    # =========================================================
 
     sensor_problems = []
 
@@ -271,9 +282,9 @@ def detect_fault(data):
             )
         })
 
-    # -----------------------------------
+    # =========================================================
     # NO FAULT
-    # -----------------------------------
+    # =========================================================
 
     if not faults:
         return {
@@ -288,20 +299,20 @@ def detect_fault(data):
             )
         }
 
-    # -----------------------------------
+    # =========================================================
     # SELECT MOST LIKELY FAULT
-    # -----------------------------------
+    # =========================================================
 
     best_fault = max(
         faults,
         key=lambda x: x["score"]
     )
 
-    # -----------------------------------
-    # CONFIDENCE AND SEVERITY
-    # -----------------------------------
-
     score = best_fault["score"]
+
+    # =========================================================
+    # CONFIDENCE AND SEVERITY
+    # =========================================================
 
     if score >= 4:
         confidence = 95
@@ -315,9 +326,9 @@ def detect_fault(data):
         confidence = 80
         severity = "MEDIUM"
 
-    # -----------------------------------
+    # =========================================================
     # RETURN RESULT
-    # -----------------------------------
+    # =========================================================
 
     return {
         "fault": best_fault["fault"],
@@ -328,49 +339,55 @@ def detect_fault(data):
     }
 
 
-# -----------------------------------
+# =========================================================
 # TEST THE MODULE
-# -----------------------------------
+# =========================================================
 
 if __name__ == "__main__":
 
-    normal_data = {
-        "rpm": 2400,
-        "egt": 680,
-        "cht": 155,
-        "oil_pressure": 4.4,
-        "oil_temperature": 92,
-        "vibration": 2.0,
-        "fuel_flow": 20,
-        "throttle": 70
+    test_cases = {
+
+        "NORMAL": {
+            "rpm": 2400,
+            "egt": 680,
+            "cht": 155,
+            "oil_pressure": 4.4,
+            "oil_temperature": 92,
+            "vibration": 2.0,
+            "fuel_flow": 20,
+            "throttle": 70
+        },
+
+        "LOW OIL": {
+            "rpm": 2437,
+            "egt": 697,
+            "cht": 158,
+            "oil_pressure": 2.17,
+            "oil_temperature": 102.9,
+            "vibration": 2.39,
+            "fuel_flow": 19.72,
+            "throttle": 68.8
+        }
     }
 
-    result = detect_fault(normal_data)
+    print("\n==============================================")
+    print("        AERO-SENTINEL FAULT DETECTOR")
+    print("==============================================")
 
-    print("\n========== AERO-SENTINEL ==========")
-    print("        FAULT DETECTOR")
-    print("====================================")
+    for name, data in test_cases.items():
 
-    print(
-        "Fault:",
-        result["fault"]
-    )
+        result = detect_fault(data)
 
-    print(
-        "Confidence:",
-        result["confidence"],
-        "%"
-    )
+        print(f"\n--- {name} ---")
+        print("Fault:", result["fault"])
+        print("Confidence:", result["confidence"], "%")
+        print("Severity:", result["severity"])
 
-    print(
-        "Severity:",
-        result["severity"]
-    )
+        print("Evidence:")
+        for item in result["evidence"]:
+            print("-", item)
 
-    print("\nEvidence:")
+        print("Recommendation:")
+        print(result["recommendation"])
 
-    for item in result["evidence"]:
-        print("-", item)
-
-    print("\nRecommendation:")
-    print(result["recommendation"])
+    print("\n==============================================")

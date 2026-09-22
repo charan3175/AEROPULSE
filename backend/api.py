@@ -1,5 +1,28 @@
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+
+# ============================================================
+# PROJECT PATH
+# ============================================================
+# Allows the backend to find the sibling "security" folder
+# even when FastAPI is started from inside the backend folder.
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ============================================================
+# ENGINE IMPORTS
+# ============================================================
 
 try:
     from .main import run_engine_pipeline
@@ -17,7 +40,6 @@ try:
 except ImportError:
     from main import run_engine_pipeline
     from engine_simulator import generate_engine_data
-
     from database_service import (
         save_engine_telemetry,
         get_recent_telemetry,
@@ -30,6 +52,19 @@ except ImportError:
 
 
 # ============================================================
+# SECURITY IMPORT
+# ============================================================
+
+try:
+    from security.secure_api import run_secure_telemetry_test
+
+except ImportError:
+    # Fallback if the security folder is being treated
+    # as a local package.
+    from security.secure_api import run_secure_telemetry_test
+
+
+# ============================================================
 # AERO-SENTINEL FASTAPI APPLICATION
 # ============================================================
 
@@ -37,9 +72,10 @@ app = FastAPI(
     title="AERO-SENTINEL API",
     description=(
         "AI-Enabled Digital Twin for "
-        "MALE UAV Engine Reliability"
+        "MALE UAV Engine Reliability "
+        "with Secure Telemetry Validation"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -53,10 +89,51 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# SECURITY TELEMETRY REQUEST MODEL
+# ============================================================
+
+class SecurityTelemetryRequest(BaseModel):
+    """
+    Telemetry values supplied by the Security Test UI.
+
+    These values are intentionally editable so the evaluator
+    can demonstrate legitimate and modified telemetry.
+    """
+
+    device_id: str = "UAV-ENGINE-001"
+
+    rpm: float = 2400
+    egt: float = 700
+    cht: float = 155
+
+    oil_pressure: float = 4.2
+
+    vibration: float = 2.1
+
+
+# ============================================================
+# SECURITY SEQUENCE COUNTER
+# ============================================================
+# A monotonically increasing sequence number is used so that
+# repeated packets can later be demonstrated as replay attacks.
+
+security_sequence_number = 1000
+
+
+def get_next_security_sequence() -> int:
+    global security_sequence_number
+
+    security_sequence_number += 1
+
+    return security_sequence_number
 
 
 # ============================================================
@@ -69,6 +146,7 @@ def root():
         "project": "AERO-SENTINEL",
         "status": "API running",
         "message": "Digital Twin backend is online",
+        "security": "Secure telemetry module available",
     }
 
 
@@ -139,9 +217,6 @@ def engine_fault_test(
     return result
 
 
-
-
-
 # ============================================================
 # TELEMETRY HISTORY
 # ============================================================
@@ -154,9 +229,14 @@ def engine_history(
     Return historical telemetry stored in PostgreSQL.
     """
 
-    telemetry = get_recent_telemetry(
-        limit
-    )
+    try:
+        telemetry = get_recent_telemetry(
+            limit
+        )
+    except Exception as error:
+        # Keep the dashboard usable when PostgreSQL is unavailable.
+        print(f"Telemetry history unavailable: {error}")
+        telemetry = []
 
     return {
         "count": len(telemetry),
@@ -199,9 +279,14 @@ def engine_replay(
     PostgreSQL telemetry.
     """
 
-    telemetry = get_recent_telemetry(
-        limit
-    )
+    try:
+        telemetry = get_recent_telemetry(
+            limit
+        )
+    except Exception as error:
+        # Keep replay available as an empty state when PostgreSQL is unavailable.
+        print(f"Mission replay unavailable: {error}")
+        telemetry = []
 
     replay_states = []
 
@@ -217,18 +302,10 @@ def engine_replay(
             "egt": item["egt"],
             "cht": item["cht"],
             "oil_pressure": item["oil_pressure"],
-            "oil_temperature": item[
-                "oil_temperature"
-            ],
-            "vibration": item[
-                "vibration"
-            ],
-            "fuel_flow": item[
-                "fuel_flow"
-            ],
-            "throttle": item[
-                "throttle"
-            ],
+            "oil_temperature": item["oil_temperature"],
+            "vibration": item["vibration"],
+            "fuel_flow": item["fuel_flow"],
+            "throttle": item["throttle"],
         }
 
         # --------------------------------------------
@@ -279,23 +356,13 @@ def engine_replay(
 
         replay_states.append(
             {
-                "timestamp": item[
-                    "timestamp"
-                ],
-
+                "timestamp": item["timestamp"],
                 "engine_data": engine_data,
-
                 "health": health_result,
-
                 "fault": fault_result,
-
                 "rul": rul_result,
-
                 "mission_risk": mission_risk,
-
-                "fault_mode": item[
-                    "fault_mode"
-                ],
+                "fault_mode": item["fault_mode"],
             }
         )
 
@@ -305,6 +372,11 @@ def engine_replay(
         ),
         "replay": replay_states,
     }
+
+
+# ============================================================
+# MISSION SCENARIO
+# ============================================================
 
 @app.get("/engine/mission-scenario")
 def engine_mission_scenario(
@@ -394,6 +466,122 @@ def engine_mission_scenario(
         "rul": rul_result,
         "mission_risk": mission_risk,
     }
+
+
+# ============================================================
+# SECURITY — SECURE TELEMETRY
+# ============================================================
+
+@app.post("/security/telemetry")
+def security_telemetry(
+    request: SecurityTelemetryRequest
+):
+    """
+    Secure telemetry demonstration endpoint.
+
+    Flow:
+
+    Editable telemetry
+            ↓
+    Device Authentication
+            ↓
+    ML-KEM-768
+            +
+    QKD Simulation
+            ↓
+    Hybrid Session Key
+            ↓
+    HKDF-SHA256
+            ↓
+    AES-256-GCM
+            ↓
+    Replay Protection
+            ↓
+    Decryption
+            ↓
+    ACCEPTED / REJECTED
+    """
+
+    sequence_number = get_next_security_sequence()
+
+    telemetry = {
+        "device_id": request.device_id,
+        "rpm": request.rpm,
+        "egt": request.egt,
+        "cht": request.cht,
+        "oil_pressure": request.oil_pressure,
+        "vibration": request.vibration,
+    }
+
+    try:
+
+        result = run_secure_telemetry_test(
+            telemetry=telemetry,
+            device_id=request.device_id,
+            sequence_number=sequence_number,
+        )
+
+        # Add demonstration information.
+        result["demo"] = {
+            "sequence_number": sequence_number,
+            "telemetry": telemetry,
+            "editable": True,
+        }
+
+        return result
+
+    except Exception as error:
+
+        return {
+            "status": "REJECTED",
+            "stage": "SECURITY_PIPELINE",
+            "message": (
+                "Secure telemetry processing failed."
+            ),
+            "error": str(error),
+            "demo": {
+                "sequence_number": sequence_number,
+                "telemetry": telemetry,
+                "editable": True,
+            },
+        }
+
+
+# ============================================================
+# SECURITY STATUS
+# ============================================================
+
+@app.get("/security/status")
+def security_status():
+    """
+    Return the security capabilities available
+    in the AERO-SENTINEL prototype.
+    """
+
+    return {
+        "system": "AERO-SENTINEL Security Layer",
+        "status": "ONLINE",
+
+        "security_chain": [
+            "Device Authentication",
+            "ML-KEM-768",
+            "QKD Simulation",
+            "Hybrid Key Establishment",
+            "HKDF-SHA256",
+            "AES-256-GCM",
+            "Replay Protection",
+            "Authenticated Decryption",
+        ],
+
+        "prototype": True,
+
+        "note": (
+            "This is a prototype security demonstration. "
+            "It is not a certified military security system."
+        ),
+    }
+
+
 # ============================================================
 # SYSTEM INFORMATION
 # ============================================================
@@ -411,7 +599,7 @@ def system_info():
             "Digital Twin Engine Monitoring"
         ),
 
-        "version": "1.0.0",
+        "version": "1.1.0",
 
         "status": "ONLINE",
 
@@ -425,5 +613,11 @@ def system_info():
             "Historical Telemetry",
             "Mission Replay",
             "AI Anomaly Detection",
+            "Secure Telemetry",
+            "Device Authentication",
+            "ML-KEM-768",
+            "QKD Simulation",
+            "AES-256-GCM",
+            "Replay Protection",
         ],
     }

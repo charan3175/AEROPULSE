@@ -1,7 +1,3 @@
-import pandas as pd
-from sklearn.ensemble import IsolationForest
-
-
 FEATURES = [
     "rpm",
     "egt",
@@ -38,6 +34,9 @@ def detect_anomalies(history):
         }
 
     try:
+        import pandas as pd
+        from sklearn.ensemble import IsolationForest
+
         df = pd.DataFrame(history)
 
         # Make sure all required features exist

@@ -2,7 +2,7 @@
 
 import * as THREE from "three";
 import { useFrame } from "@react-three/fiber";
-import { useRef } from "react";
+import { useRef, useState } from "react";
 
 type EngineProps = {
   rpm: number;
@@ -460,11 +460,12 @@ export default function RealisticEngine({
 }: EngineProps) {
   const engineRef = useRef<THREE.Group>(null);
 
-  const crankAngle = useRef(0);
+  const [crankAngle, setCrankAngle] = useState(0);
 
   useFrame((_, delta) => {
-    crankAngle.current +=
-      delta * Math.max(rpm, 300) * 0.025;
+    setCrankAngle(
+      (angle) => angle + delta * Math.max(rpm, 300) * 0.025
+    );
   });
 
   /*
@@ -477,7 +478,7 @@ export default function RealisticEngine({
   const phases = [0, Math.PI, 0, Math.PI];
 
   const pistonPositions = phases.map((phase) => {
-    return 0.48 + Math.sin(crankAngle.current + phase) * 0.32;
+    return 0.48 + Math.sin(crankAngle + phase) * 0.32;
   });
 
   /*
@@ -485,7 +486,7 @@ export default function RealisticEngine({
   */
 
   const crankPositions = phases.map((phase) => {
-    const a = crankAngle.current + phase;
+    const a = crankAngle + phase;
 
     return {
       y: -0.45 + Math.sin(a) * 0.28,

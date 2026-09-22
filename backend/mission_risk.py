@@ -58,7 +58,11 @@ def calculate_mission_risk(
     # 2. FAULT SEVERITY
     # ---------------------------------------------------------
 
-    if severity == "HIGH":
+    if severity == "CRITICAL":
+        risk_score += 40
+        risk_factors.append("Critical-severity engine fault")
+
+    elif severity == "HIGH":
         risk_score += 30
         risk_factors.append("High-severity engine fault")
 
@@ -182,6 +186,21 @@ def calculate_mission_risk(
 
     else:
         risk_level = "LOW"
+
+    # ---------------------------------------------------------
+    # SAFETY OVERRIDE
+    # ---------------------------------------------------------
+    # A critical engine fault should never result in a
+    # low/medium mission risk classification.
+
+    if severity == "CRITICAL":
+        risk_score = max(risk_score, 75)
+        risk_level = "CRITICAL"
+
+        if "Critical engine fault requires mission restriction" not in risk_factors:
+            risk_factors.append(
+                "Critical engine fault requires mission restriction"
+            )
 
     # ---------------------------------------------------------
     # DECISION

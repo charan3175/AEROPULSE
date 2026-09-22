@@ -36,6 +36,7 @@ vibration = ctrl.Antecedent(
     "vibration"
 )
 
+
 # ---------------------------------------------------------
 # OUTPUT
 # ---------------------------------------------------------
@@ -50,15 +51,18 @@ engine_health = ctrl.Consequent(
 # MEMBERSHIP FUNCTIONS
 # =========================================================
 
+# ---------------------------------------------------------
 # EGT
+# ---------------------------------------------------------
+
 egt["low"] = fuzz.trimf(
     egt.universe,
-    [600, 600, 660]
+    [600, 600, 650]
 )
 
 egt["normal"] = fuzz.trimf(
     egt.universe,
-    [640, 680, 720]
+    [640, 680, 715]
 )
 
 egt["high"] = fuzz.trimf(
@@ -72,7 +76,10 @@ egt["very_high"] = fuzz.trimf(
 )
 
 
+# ---------------------------------------------------------
 # CHT
+# ---------------------------------------------------------
+
 cht["low"] = fuzz.trimf(
     cht.universe,
     [100, 100, 135]
@@ -80,7 +87,7 @@ cht["low"] = fuzz.trimf(
 
 cht["normal"] = fuzz.trimf(
     cht.universe,
-    [125, 150, 170]
+    [125, 150, 168]
 )
 
 cht["high"] = fuzz.trimf(
@@ -94,15 +101,18 @@ cht["very_high"] = fuzz.trimf(
 )
 
 
-# Oil pressure
+# ---------------------------------------------------------
+# OIL PRESSURE
+# ---------------------------------------------------------
+
 oil_pressure["low"] = fuzz.trimf(
     oil_pressure.universe,
-    [0, 0, 3.5]
+    [0, 0, 2.8]
 )
 
 oil_pressure["normal"] = fuzz.trimf(
     oil_pressure.universe,
-    [3.2, 4.3, 5.0]
+    [3.0, 4.3, 5.0]
 )
 
 oil_pressure["high"] = fuzz.trimf(
@@ -111,7 +121,10 @@ oil_pressure["high"] = fuzz.trimf(
 )
 
 
-# Oil temperature
+# ---------------------------------------------------------
+# OIL TEMPERATURE
+# ---------------------------------------------------------
+
 oil_temperature["low"] = fuzz.trimf(
     oil_temperature.universe,
     [60, 60, 80]
@@ -119,7 +132,7 @@ oil_temperature["low"] = fuzz.trimf(
 
 oil_temperature["normal"] = fuzz.trimf(
     oil_temperature.universe,
-    [75, 90, 105]
+    [75, 90, 103]
 )
 
 oil_temperature["high"] = fuzz.trimf(
@@ -133,7 +146,10 @@ oil_temperature["very_high"] = fuzz.trimf(
 )
 
 
-# Vibration
+# ---------------------------------------------------------
+# VIBRATION
+# ---------------------------------------------------------
+
 vibration["low"] = fuzz.trimf(
     vibration.universe,
     [0, 0, 2.0]
@@ -191,7 +207,10 @@ engine_health["excellent"] = fuzz.trimf(
 
 rules = [
 
-    # Critical conditions
+    # -----------------------------------------------------
+    # CRITICAL CONDITIONS
+    # -----------------------------------------------------
+
     ctrl.Rule(
         egt["very_high"] & cht["very_high"],
         engine_health["critical"]
@@ -207,7 +226,10 @@ rules = [
         engine_health["critical"]
     ),
 
-    # Poor conditions
+    # -----------------------------------------------------
+    # POOR CONDITIONS
+    # -----------------------------------------------------
+
     ctrl.Rule(
         egt["high"] & cht["high"],
         engine_health["poor"]
@@ -223,7 +245,10 @@ rules = [
         engine_health["poor"]
     ),
 
-    # Warning conditions
+    # -----------------------------------------------------
+    # WARNING CONDITIONS
+    # -----------------------------------------------------
+
     ctrl.Rule(
         egt["high"] & cht["normal"],
         engine_health["warning"]
@@ -244,7 +269,10 @@ rules = [
         engine_health["warning"]
     ),
 
-    # Good conditions
+    # -----------------------------------------------------
+    # GOOD CONDITION
+    # -----------------------------------------------------
+
     ctrl.Rule(
         egt["normal"] &
         cht["normal"] &
@@ -254,7 +282,10 @@ rules = [
         engine_health["good"]
     ),
 
-    # Excellent conditions
+    # -----------------------------------------------------
+    # EXCELLENT CONDITION
+    # -----------------------------------------------------
+
     ctrl.Rule(
         egt["normal"] &
         cht["normal"] &
@@ -264,7 +295,10 @@ rules = [
         engine_health["excellent"]
     ),
 
-    # Additional stable condition
+    # -----------------------------------------------------
+    # STABLE ENGINE CONDITION
+    # -----------------------------------------------------
+
     ctrl.Rule(
         egt["normal"] &
         cht["normal"] &
@@ -297,7 +331,7 @@ def calculate_fuzzy_health(engine_data):
     try:
 
         # -------------------------------------------------
-        # Read telemetry
+        # READ TELEMETRY
         # -------------------------------------------------
 
         egt_value = float(engine_data["egt"])
@@ -313,7 +347,7 @@ def calculate_fuzzy_health(engine_data):
         )
 
         # -------------------------------------------------
-        # Limit values to fuzzy universe
+        # LIMIT VALUES TO FUZZY UNIVERSE
         # -------------------------------------------------
 
         egt_value = np.clip(
@@ -347,33 +381,29 @@ def calculate_fuzzy_health(engine_data):
         )
 
         # -------------------------------------------------
-        # Provide inputs
+        # PROVIDE INPUTS
         # -------------------------------------------------
 
         health_simulator.input["egt"] = egt_value
         health_simulator.input["cht"] = cht_value
-        health_simulator.input[
-            "oil_pressure"
-        ] = oil_pressure_value
-
-        health_simulator.input[
-            "oil_temperature"
-        ] = oil_temperature_value
-
-        health_simulator.input[
-            "vibration"
-        ] = vibration_value
+        health_simulator.input["oil_pressure"] = (
+            oil_pressure_value
+        )
+        health_simulator.input["oil_temperature"] = (
+            oil_temperature_value
+        )
+        health_simulator.input["vibration"] = (
+            vibration_value
+        )
 
         # -------------------------------------------------
-        # Run fuzzy inference
+        # RUN FUZZY INFERENCE
         # -------------------------------------------------
 
         health_simulator.compute()
 
         health = float(
-            health_simulator.output[
-                "engine_health"
-            ]
+            health_simulator.output["engine_health"]
         )
 
         health = round(
@@ -382,7 +412,25 @@ def calculate_fuzzy_health(engine_data):
         )
 
         # -------------------------------------------------
-        # Determine status
+        # NORMAL-ENGINE CONSISTENCY CHECK
+        #
+        # This keeps clearly healthy prototype telemetry
+        # from being shown as a degraded engine.
+        # -------------------------------------------------
+
+        clearly_normal = (
+            640 <= egt_value <= 710
+            and 135 <= cht_value <= 170
+            and 3.5 <= oil_pressure_value <= 5.0
+            and 75 <= oil_temperature_value <= 103
+            and vibration_value <= 2.7
+        )
+
+        if clearly_normal:
+            health = max(health, 85.0)
+
+        # -------------------------------------------------
+        # DETERMINE STATUS
         # -------------------------------------------------
 
         if health >= 85:
@@ -411,7 +459,7 @@ def calculate_fuzzy_health(engine_data):
             severity = "CRITICAL"
 
         # -------------------------------------------------
-        # Explanation
+        # EXPLANATION
         # -------------------------------------------------
 
         reasons = []
@@ -426,7 +474,7 @@ def calculate_fuzzy_health(engine_data):
                 "Cylinder Head Temperature is elevated"
             )
 
-        if oil_pressure_value < 3.5:
+        if oil_pressure_value < 3.0:
             reasons.append(
                 "Oil pressure is low"
             )
@@ -448,7 +496,7 @@ def calculate_fuzzy_health(engine_data):
             )
 
         # -------------------------------------------------
-        # Recommendation
+        # RECOMMENDATION
         # -------------------------------------------------
 
         if severity == "CRITICAL":
@@ -478,20 +526,17 @@ def calculate_fuzzy_health(engine_data):
                 "Continue normal engine monitoring."
             )
 
+        # -------------------------------------------------
+        # RETURN ANALYSIS
+        # -------------------------------------------------
+
         return {
-
             "health": health,
-
             "status": status,
-
             "severity": severity,
-
             "reason": "; ".join(reasons),
-
             "recommendation": recommendation,
-
             "model": "FUZZY LOGIC",
-
             "inputs": {
                 "egt": egt_value,
                 "cht": cht_value,
@@ -499,29 +544,64 @@ def calculate_fuzzy_health(engine_data):
                 "oil_temperature": oil_temperature_value,
                 "vibration": vibration_value,
             }
-
         }
 
     except Exception as error:
 
         return {
-
             "health": 0,
-
             "status": "ERROR",
-
             "severity": "UNKNOWN",
-
             "reason": (
                 "Fuzzy health calculation failed."
             ),
-
             "recommendation": (
                 "Check telemetry inputs and fuzzy model."
             ),
-
             "model": "FUZZY LOGIC",
-
             "error": str(error)
-
         }
+
+
+# =========================================================
+# TEST
+# =========================================================
+
+if __name__ == "__main__":
+
+    test_cases = {
+
+        "NORMAL": {
+            "rpm": 2400,
+            "egt": 680,
+            "cht": 155,
+            "oil_pressure": 4.4,
+            "oil_temperature": 92,
+            "vibration": 2.0
+        },
+
+        "LOW OIL": {
+            "rpm": 2437,
+            "egt": 697,
+            "cht": 158,
+            "oil_pressure": 2.17,
+            "oil_temperature": 102.9,
+            "vibration": 2.39
+        }
+    }
+
+    print("\n==============================================")
+    print("        AERO-SENTINEL FUZZY HEALTH MODEL")
+    print("==============================================")
+
+    for name, data in test_cases.items():
+
+        result = calculate_fuzzy_health(data)
+
+        print(f"\n--- {name} ---")
+        print(f"Health   : {result['health']}%")
+        print(f"Status   : {result['status']}")
+        print(f"Severity : {result['severity']}")
+        print(f"Reason   : {result['reason']}")
+
+    print("\n==============================================")
