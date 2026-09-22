@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useState, useRef, useMemo } from "react";
+import { useCallback, useEffect, useState, useRef, useMemo } from "react";
 
 import {
   Activity,
@@ -37,6 +37,8 @@ import {
   Tooltip,
   Legend,
 } from "recharts";
+
+import SecurityTelemetryPanel from "./components/SecurityTelemetryPanel";
 
 /* =========================================================
    DIGITAL TWIN
@@ -163,7 +165,8 @@ type ReplayState = {
    API
    ========================================================= */
 
-const API_BASE_URL = "http://127.0.0.1:8001";
+const API_BASE_URL = "http://127.0.0.1:8003";
+const LIVE_REFRESH_MS = 1000;
 
 type ChartRangeKey =
   | "5m"
@@ -376,7 +379,7 @@ export default function HomePage() {
 
   const historyRefreshMs =
     selectedChartRange.minutes !== null && selectedChartRange.minutes <= 60
-      ? 5000
+      ? LIVE_REFRESH_MS
       : selectedChartRange.minutes === 360
         ? 15000
         : 60000;
@@ -443,11 +446,11 @@ export default function HomePage() {
   const [shakeActive, setShakeActive] =
     useState(false);
 
-  const alarmContextRef =
-    useRef<AudioContext | null>(null);
+  const alarmAudioRef =
+    useRef<HTMLAudioElement | null>(null);
 
-  const alarmIntervalRef =
-    useRef<number | null>(null);
+  const alarmGapTimerRef =
+    useRef<NodeJS.Timeout | null>(null);
 
   const previousDangerRef =
     useRef(false);
@@ -460,6 +463,9 @@ export default function HomePage() {
 
   const [alertAcknowledged, setAlertAcknowledged] =
     useState(false);
+
+  const [activeNavigation, setActiveNavigation] =
+    useState("Dashboard");
 
 
   /* =========================================================
@@ -698,7 +704,7 @@ export default function HomePage() {
     const engineInterval =
       setInterval(
         fetchEngineData,
-        2000
+        LIVE_REFRESH_MS
       );
 
     const historyInterval =
@@ -821,7 +827,8 @@ export default function HomePage() {
     replayTimerRef.current =
       setTimeout(() => {
         setReplayIndex(
-          (previous) => previous + 1
+          (previous) =>
+            previous + 1
         );
         if (replayIndex + 1 >= replayData.length - 1) {
           setIsReplayPlaying(false);
@@ -918,34 +925,51 @@ export default function HomePage() {
     {
       name: "Dashboard",
       icon: HomeIcon,
-      active: true,
+      target: "dashboard",
     },
     {
       name: "Engine Health",
       icon: Gauge,
-      active: false,
+      target: "engine-health",
     },
     {
       name: "Sensors",
       icon: Activity,
-      active: false,
+      target: "sensors",
     },
     {
       name: "Fault Detection",
       icon: AlertTriangle,
-      active: false,
+      target: "alerts",
     },
     {
       name: "Predictions",
       icon: BrainCircuit,
-      active: false,
+      target: "predictions",
     },
     {
       name: "Missions",
       icon: Plane,
-      active: false,
+      target: "missions",
     },
   ];
+
+  const navigateTo = (name: string, target: string) => {
+    setActiveNavigation(name);
+
+    if (name === "Predictions") {
+      window.scrollTo({
+        top: document.documentElement.scrollHeight,
+        behavior: "smooth",
+      });
+      return;
+    }
+
+    document.getElementById(target)?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  };
 
   /* =========================================================
      SENSOR DATA
@@ -1260,7 +1284,7 @@ export default function HomePage() {
      WARNING ALARM + EARTHQUAKE WARNING CONTROL
      ========================================================= */
 
-  const clearShakeTimers = () => {
+  const clearShakeTimers = useCallback(() => {
     if (shakeTimerRef.current) {
       clearTimeout(shakeTimerRef.current);
       shakeTimerRef.current = null;
@@ -1270,133 +1294,78 @@ export default function HomePage() {
       window.clearInterval(shakeIntervalRef.current);
       shakeIntervalRef.current = null;
     }
-  };
+  }, []);
 
-  const stopAlarm = () => {
-    if (alarmIntervalRef.current !== null) {
-      window.clearInterval(
-        alarmIntervalRef.current
-      );
-      alarmIntervalRef.current = null;
+  const stopAlarm = useCallback(() => {
+    if (alarmGapTimerRef.current) {
+      clearTimeout(alarmGapTimerRef.current);
+      alarmGapTimerRef.current = null;
     }
 
-    if (alarmContextRef.current) {
-      void alarmContextRef.current
-        .suspend()
-        .catch(() => undefined);
-    }
-  };
+    const audio = alarmAudioRef.current;
 
-  const startAlarm = () => {
+    if (!audio) {
+      return;
+    }
+
+    audio.pause();
+    audio.currentTime = 0;
+  }, []);
+
+  const startAlarm = useCallback(() => {
     if (alarmMuted || typeof window === "undefined") {
       return;
     }
 
-    if (!alarmContextRef.current) {
-      const AudioContextClass =
-        window.AudioContext ||
-        (window as typeof window & {
-          webkitAudioContext?: typeof AudioContext;
-        }).webkitAudioContext;
+    let audio = alarmAudioRef.current;
 
-      if (!AudioContextClass) {
-        return;
-      }
-
-      alarmContextRef.current =
-        new AudioContextClass();
+    if (!audio) {
+      audio = new Audio("/alarm.wav");
+      audio.preload = "auto";
+      audio.volume = 0.9;
+      alarmAudioRef.current = audio;
     }
 
-    const audioContext =
-      alarmContextRef.current;
-
-    const playPoliceSiren = () => {
-      try {
-        if (audioContext.state === "suspended") {
-          void audioContext.resume();
-        }
-
-        const now = audioContext.currentTime;
-        const oscillator =
-          audioContext.createOscillator();
-        const gain =
-          audioContext.createGain();
-
-        // Police-siren style: "vuy-vuy-vuy"
-        // Three rising/falling sweeps over 3 seconds.
-        oscillator.type = "sawtooth";
-        oscillator.frequency.setValueAtTime(
-          520,
-          now
-        );
-
-        oscillator.frequency.linearRampToValueAtTime(
-          1050,
-          now + 0.5
-        );
-        oscillator.frequency.linearRampToValueAtTime(
-          520,
-          now + 1.0
-        );
-        oscillator.frequency.linearRampToValueAtTime(
-          1050,
-          now + 1.5
-        );
-        oscillator.frequency.linearRampToValueAtTime(
-          520,
-          now + 2.0
-        );
-        oscillator.frequency.linearRampToValueAtTime(
-          1050,
-          now + 2.5
-        );
-        oscillator.frequency.linearRampToValueAtTime(
-          520,
-          now + 3.0
-        );
-
-        gain.gain.setValueAtTime(0.0001, now);
-        gain.gain.linearRampToValueAtTime(
-          0.22,
-          now + 0.08
-        );
-        gain.gain.setValueAtTime(
-          0.22,
-          now + 2.75
-        );
-        gain.gain.exponentialRampToValueAtTime(
-          0.0001,
-          now + 3.0
-        );
-
-        oscillator.connect(gain);
-        gain.connect(audioContext.destination);
-
-        oscillator.start(now);
-        oscillator.stop(now + 3.05);
-      } catch (error) {
-        console.warn(
-          "Warning siren could not play:",
-          error
-        );
-      }
-    };
-
-    if (alarmIntervalRef.current !== null) {
+    if (!audio.paused) {
       return;
     }
 
-    // 3 seconds siren + 3 seconds silent gap.
-    playPoliceSiren();
+    const playAlarmSound = () => {
+      if (alarmMuted || !alarmAudioRef.current) {
+        return;
+      }
 
-    alarmIntervalRef.current =
-      window.setInterval(
-        playPoliceSiren,
-        6000
-      );
-  };
+      const currentAudio = alarmAudioRef.current;
 
-  const startEarthquakeShake = () => {
+      currentAudio.currentTime = 0;
+
+      void currentAudio.play().catch((error) => {
+        console.warn(
+          "Alarm audio could not play. Click the dashboard once and try again:",
+          error
+        );
+      });
+
+      currentAudio.onended = () => {
+        if (alarmMuted || !dangerState || !alarmAudioRef.current) {
+          return;
+        }
+
+        alarmGapTimerRef.current = setTimeout(() => {
+          alarmGapTimerRef.current = null;
+          if (!alarmMuted && dangerState) {
+            playAlarmSound();
+          }
+        }, 3000);
+      };
+    };
+
+    // Use the uploaded alarm.wav instead of generating a synthetic siren.
+    // The sound repeats with a 3-second silent gap after each file finishes.
+    playAlarmSound();
+  }, [alarmMuted, dangerState]);
+
+  const startEarthquakeShake = useCallback(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -1427,12 +1396,12 @@ export default function HomePage() {
         shakeForThreeSeconds,
         6000
       );
-  };
+  }, [clearShakeTimers]);
 
-  const stopEarthquakeShake = () => {
+  const stopEarthquakeShake = useCallback(() => {
     clearShakeTimers();
     setShakeActive(false);
-  };
+  }, [clearShakeTimers]);
 
   /*
      Serious/red fault:
@@ -1475,21 +1444,23 @@ export default function HomePage() {
 
     previousDangerRef.current =
       dangerState;
-  }, [dangerState, alarmMuted, alertAcknowledged]);
+  }, [
+    dangerState,
+    alarmMuted,
+    alertAcknowledged,
+    startAlarm,
+    startEarthquakeShake,
+    stopAlarm,
+    stopEarthquakeShake,
+  ]);
 
   /* Stop alarm and shake timers when the page closes. */
   useEffect(() => {
     return () => {
       stopAlarm();
       stopEarthquakeShake();
-
-      if (alarmContextRef.current) {
-        void alarmContextRef.current
-          .close()
-          .catch(() => undefined);
-      }
     };
-  }, []);
+  }, [stopAlarm, stopEarthquakeShake]);
 
   /* =========================================================
      RETURN UI
@@ -1583,13 +1554,13 @@ export default function HomePage() {
                 item.icon;
 
               return (
-                <div
+                <button
+                  type="button"
                   key={item.name}
                   className={`nav-item ${
-                    item.active
-                      ? "active"
-                      : ""
+                    activeNavigation === item.name ? "active" : ""
                   }`}
+                  onClick={() => navigateTo(item.name, item.target)}
                 >
 
                   <Icon size={18} />
@@ -1598,7 +1569,7 @@ export default function HomePage() {
                     {item.name}
                   </span>
 
-                </div>
+                </button>
               );
             }
           )}
@@ -1607,20 +1578,32 @@ export default function HomePage() {
             SYSTEM
           </p>
 
-          <div className="nav-item">
+          <button
+            type="button"
+            className={`nav-item ${activeNavigation === "Alerts" ? "active" : ""}`}
+            onClick={() => navigateTo("Alerts", "alerts")}
+          >
             <Bell size={18} />
             <span>Alerts</span>
-          </div>
+          </button>
 
-          <div className="nav-item">
+          <button
+            type="button"
+            className={`nav-item ${activeNavigation === "Maintenance" ? "active" : ""}`}
+            onClick={() => navigateTo("Maintenance", "predictions")}
+          >
             <Wrench size={18} />
             <span>Maintenance</span>
-          </div>
+          </button>
 
-          <div className="nav-item">
+          <button
+            type="button"
+            className={`nav-item ${activeNavigation === "Settings" ? "active" : ""}`}
+            onClick={() => navigateTo("Settings", "settings")}
+          >
             <Settings size={18} />
             <span>Settings</span>
-          </div>
+          </button>
 
         </nav>
 
@@ -1648,7 +1631,7 @@ export default function HomePage() {
           MAIN CONTENT
           ===================================================== */}
 
-      <section className="main-content">
+      <section id="dashboard" className="main-content">
 
         {/* ===================================================
             HEADER
@@ -1670,6 +1653,8 @@ export default function HomePage() {
 
           <div className="header-right">
 
+            <SecurityTelemetryPanel />
+
             <div className="connection">
 
               <span
@@ -1688,7 +1673,7 @@ export default function HomePage() {
 
             </div>
 
-            <div className="fault-selector">
+            <div id="settings" className="fault-selector">
 
               <label htmlFor="fault-select">
                 SIMULATION
@@ -1798,6 +1783,7 @@ export default function HomePage() {
             =================================================== */}
 
         <div
+          id="alerts"
           role={dangerState ? "button" : undefined}
           tabIndex={dangerState ? 0 : undefined}
           onClick={
@@ -1994,7 +1980,7 @@ export default function HomePage() {
             KPI CARDS
             =================================================== */}
 
-        <div className="kpi-grid">
+        <div id="engine-health" className="kpi-grid">
 
           {/* ENGINE HEALTH */}
 
@@ -2211,7 +2197,7 @@ export default function HomePage() {
             DIGITAL TWIN + SENSOR OVERVIEW
             =================================================== */}
 
-        <div className="main-grid">
+        <div id="sensors" className="main-grid">
 
           {/* DIGITAL TWIN */}
 
@@ -2258,6 +2244,13 @@ export default function HomePage() {
               fault={
                 faultName
               }
+              severity={faultSeverity}
+              egt={activeEngineData?.egt}
+              cht={activeEngineData?.cht}
+              oilPressure={activeEngineData?.oil_pressure}
+              vibration={activeEngineData?.vibration}
+              riskScore={riskScore}
+              riskLevel={riskLevel}
             />
 
             <div className="twin-footer">
@@ -2342,7 +2335,7 @@ export default function HomePage() {
                 <strong>
                   {replayMode
                     ? `${replaySpeed}x`
-                    : "2 sec"}
+                    : "1 sec"}
                 </strong>
 
               </div>
@@ -2502,18 +2495,14 @@ export default function HomePage() {
         </div>
 
         {/* ===================================================
-            MISSION REPLAY
-            =================================================== */}
+          MISSION REPLAY
+          =================================================== */}
 
-        <div className="panel">
+        <div id="missions" className="panel">
 
           <div className="panel-header">
 
             <div>
-
-              <p className="panel-label">
-                MISSION ANALYSIS
-              </p>
 
               <h3>
                 Mission Replay
@@ -2689,7 +2678,7 @@ export default function HomePage() {
                 color: "#64748b",
               }}
             >
-              {replayData.length} historical samples
+              {replayData.length} historical telemetry records
             </span>
 
           </div>
@@ -2946,37 +2935,6 @@ export default function HomePage() {
 
               </div>
 
-              <div
-                style={{
-                  padding: 14,
-                  borderRadius: 10,
-                  background: "#f8fafc",
-                  border:
-                    "1px solid #e2e8f0",
-                }}
-              >
-
-                <span
-                  style={{
-                    fontSize: 11,
-                    color: "#64748b",
-                  }}
-                >
-                  FAULT MODE
-                </span>
-
-                <strong
-                  style={{
-                    display: "block",
-                    fontSize: 14,
-                    marginTop: 7,
-                  }}
-                >
-                  {currentReplay.fault_mode}
-                </strong>
-
-              </div>
-
             </div>
 
           ) : (
@@ -3005,10 +2963,6 @@ export default function HomePage() {
           <div className="panel-header">
 
             <div>
-
-              <p className="panel-label">
-                POSTGRESQL HISTORY
-              </p>
 
               <h3>
                 Engine Telemetry Trends — {selectedChartRange.label}
@@ -3183,7 +3137,7 @@ export default function HomePage() {
 
               <Database size={14} />
 
-              PostgreSQL Connected
+              Database Connected
 
             </span>
 
@@ -3205,15 +3159,11 @@ export default function HomePage() {
 
         {replayData.length > 0 && (
 
-          <div className="panel">
+          <div id="predictions" className="panel">
 
             <div className="panel-header">
 
               <div>
-
-                <p className="panel-label">
-                  MISSION REPLAY ANALYTICS
-                </p>
 
                 <h3>
                   Historical Health & Risk
@@ -3303,10 +3253,6 @@ export default function HomePage() {
 
               <div>
 
-                <p className="panel-label">
-                  LUBRICATION
-                </p>
-
                 <h3>
                   Oil Pressure
                 </h3>
@@ -3372,10 +3318,6 @@ export default function HomePage() {
 
               <div>
 
-                <p className="panel-label">
-                  MECHANICAL HEALTH
-                </p>
-
                 <h3>
                   Vibration
                 </h3>
@@ -3439,15 +3381,11 @@ export default function HomePage() {
             AI ANOMALY DETECTION
             =================================================== */}
 
-        <div className="panel">
+        <div id="ai-anomaly" className="panel">
 
           <div className="panel-header">
 
             <div>
-
-              <p className="panel-label">
-                ARTIFICIAL INTELLIGENCE
-              </p>
 
               <h3>
                 AI Anomaly Detection

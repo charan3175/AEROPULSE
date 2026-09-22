@@ -161,6 +161,11 @@ def calculate_mission_risk(
 
     risk_score += mission_weight
 
+    # Keep the KPI responsive to continuous telemetry changes instead of
+    # changing only when a threshold is crossed.
+    risk_score += max(0, 85 - health) * 0.25
+    risk_score += max(0, throttle - 70) * 0.05
+
     risk_factors.append(
         f"{mission_type} mission profile"
     )

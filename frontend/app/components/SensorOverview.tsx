@@ -20,7 +20,7 @@ export default function SensorOverview() {
   const fetchSensorData = async () => {
     try {
       const response = await fetch(
-        "http://127.0.0.1:8001/engine/status?fault=normal"
+        "http://127.0.0.1:8002/engine/status?fault=normal"
       );
 
       const result = await response.json();
@@ -37,7 +37,7 @@ export default function SensorOverview() {
 
     const interval = setInterval(
       fetchSensorData,
-      2000
+      1000
     );
 
     return () => {

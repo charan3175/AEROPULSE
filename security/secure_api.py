@@ -18,10 +18,11 @@ Ground Station Decryption
 """
 
 import time
+import json
 from typing import Dict, Any
 
 try:
-    from .device_auth import authenticate_device
+    from .device_auth import authenticate_device, generate_device_signature
     from .key_manager import establish_hybrid_session
     from .aes_gcm import (
         encrypt_telemetry as encrypt_data,
@@ -29,7 +30,7 @@ try:
     )
     from .replay_protection import ReplayProtector as ReplayProtection
 except ImportError:
-    from device_auth import authenticate_device
+    from device_auth import authenticate_device, generate_device_signature
     from key_manager import establish_hybrid_session
     from aes_gcm import (
         encrypt_telemetry as encrypt_data,
@@ -47,6 +48,14 @@ DEFAULT_DEVICE_ID = "UAV-ENGINE-001"
 # One replay protection manager for the running API process.
 # In a production system this state should be persisted/shared.
 replay_guard = ReplayProtection()
+
+
+def canonical_telemetry(telemetry: Dict[str, Any]) -> str:
+    return json.dumps(
+        telemetry,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 # ============================================================
@@ -72,7 +81,11 @@ def create_secure_telemetry(
 
     auth_result = authenticate_device(
         device_id=device_id,
-        telemetry=telemetry,
+        message=canonical_telemetry(telemetry),
+        signature=generate_device_signature(
+            device_id,
+            canonical_telemetry(telemetry),
+        ),
     )
 
     if not auth_result.get("authenticated", False):
@@ -91,7 +104,18 @@ def create_secure_telemetry(
 
     hybrid_result = establish_hybrid_session()
 
-    session_key = hybrid_result["session_key"]
+    session_key = (
+        hybrid_result.get("session_key")
+        if isinstance(hybrid_result, dict)
+        else hybrid_result
+    )
+
+    if session_key is None:
+        return {
+            "status": "REJECTED",
+            "stage": "HYBRID_KEY",
+            "message": "Hybrid key establishment failed.",
+        }
 
     # --------------------------------------------------------
     # 3. PACKET METADATA
@@ -108,9 +132,9 @@ def create_secure_telemetry(
     # --------------------------------------------------------
 
     encrypted_result = encrypt_data(
-        telemetry,
+        canonical_telemetry(telemetry),
         session_key,
-        associated_data=metadata,
+        associated_data=json.dumps(metadata, sort_keys=True),
     )
 
     # --------------------------------------------------------
@@ -183,8 +207,9 @@ def receive_secure_telemetry(
         telemetry = decrypt_data(
             packet["encrypted_payload"],
             session_key,
-            associated_data=metadata,
+            associated_data=json.dumps(metadata, sort_keys=True),
         )
+        telemetry = json.loads(telemetry)
 
     except Exception:
         return {
@@ -234,15 +259,41 @@ def run_secure_telemetry_test(
 
     hybrid_result = establish_hybrid_session()
 
-    session_key = hybrid_result["session_key"]
+    session_key = (
+        hybrid_result.get("session_key")
+        if isinstance(hybrid_result, dict)
+        else hybrid_result
+    )
+
+    if session_key is None:
+        return {
+            "status": "REJECTED",
+            "stage": "HYBRID_KEY",
+            "message": "Hybrid key establishment failed.",
+        }
 
     # --------------------------------------------------------
     # 2. DEVICE AUTHENTICATION
     # --------------------------------------------------------
 
+    telemetry_message = canonical_telemetry(telemetry)
+
+    try:
+        signature = generate_device_signature(
+            device_id,
+            telemetry_message,
+        )
+    except ValueError as error:
+        return {
+            "status": "REJECTED",
+            "stage": "DEVICE_AUTHENTICATION",
+            "message": str(error),
+        }
+
     auth_result = authenticate_device(
         device_id=device_id,
-        telemetry=telemetry,
+        message=telemetry_message,
+        signature=signature,
     )
 
     if not auth_result.get("authenticated", False):
@@ -268,9 +319,9 @@ def run_secure_telemetry_test(
     }
 
     encrypted_result = encrypt_data(
-        telemetry,
+        telemetry_message,
         session_key,
-        associated_data=metadata,
+        associated_data=json.dumps(metadata, sort_keys=True),
     )
 
     packet = {
@@ -287,6 +338,8 @@ def run_secure_telemetry_test(
         session_key,
     )
 
+    receive_security = receive_result.get("security", {})
+
     return {
         "status": receive_result["status"],
 
@@ -297,20 +350,14 @@ def run_secure_telemetry_test(
             "hybrid_key": "PASS",
             "hkdf": "PASS",
             "aes_256_gcm": "PASS",
-            "replay_protection": receive_result[
-                "security"
-            ].get(
+            "replay_protection": receive_security.get(
                 "replay_protection",
                 "FAIL",
-            )
-            if receive_result["status"] == "ACCEPTED"
-            else "FAIL",
-            "decryption": receive_result["security"].get(
+            ),
+            "decryption": receive_security.get(
                 "decryption",
                 "FAIL",
-            )
-            if receive_result["status"] == "ACCEPTED"
-            else "FAIL",
+            ),
         },
 
         "metadata": metadata,

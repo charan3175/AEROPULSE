@@ -1,11 +1,13 @@
 import sys
 import time
+import base64
+import json
 from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ============================================================
@@ -56,12 +58,32 @@ except ImportError:
 # ============================================================
 
 try:
-    from security.secure_api import run_secure_telemetry_test
+    from security.secure_api import (
+        run_secure_telemetry_test,
+        canonical_telemetry,
+    )
+    from security.aes_gcm import encrypt_telemetry, decrypt_telemetry
+    from security.device_auth import (
+        authenticate_device,
+        generate_device_signature,
+    )
+    from security.key_manager import establish_hybrid_session
+    from security.replay_protection import ReplayProtector
 
 except ImportError:
     # Fallback if the security folder is being treated
     # as a local package.
-    from security.secure_api import run_secure_telemetry_test
+    from security.secure_api import (
+        run_secure_telemetry_test,
+        canonical_telemetry,
+    )
+    from security.aes_gcm import encrypt_telemetry, decrypt_telemetry
+    from security.device_auth import (
+        authenticate_device,
+        generate_device_signature,
+    )
+    from security.key_manager import establish_hybrid_session
+    from security.replay_protection import ReplayProtector
 
 
 # ============================================================
@@ -108,15 +130,20 @@ class SecurityTelemetryRequest(BaseModel):
     can demonstrate legitimate and modified telemetry.
     """
 
-    device_id: str = "UAV-ENGINE-001"
+    device_id: str = Field(default="UAV-ENGINE-001", min_length=1, max_length=80)
 
-    rpm: float = 2400
-    egt: float = 700
-    cht: float = 155
+    rpm: float = Field(default=2400, ge=0, le=10000)
+    egt: float = Field(default=700, ge=0, le=2000)
+    cht: float = Field(default=155, ge=0, le=500)
 
-    oil_pressure: float = 4.2
+    oil_pressure: float = Field(default=4.2, ge=0, le=20)
 
-    vibration: float = 2.1
+    vibration: float = Field(default=2.1, ge=0, le=100)
+
+
+class SecurityTestRequest(BaseModel):
+    test_type: str = Field(default="valid", min_length=1, max_length=30)
+    telemetry: SecurityTelemetryRequest | None = None
 
 
 # ============================================================
@@ -528,6 +555,12 @@ def security_telemetry(
             "editable": True,
         }
 
+        result.setdefault("metadata", {
+            "device_id": request.device_id,
+            "sequence_number": sequence_number,
+            "timestamp": time.time(),
+        })
+
         return result
 
     except Exception as error:
@@ -545,6 +578,191 @@ def security_telemetry(
                 "editable": True,
             },
         }
+
+
+def _security_test_result(
+    test: str,
+    status: str,
+    passed: bool,
+    message: str,
+    checks: Dict[str, str],
+    details: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    result = {
+        "test": test,
+        "status": status,
+        "passed": passed,
+        "message": message,
+        "checks": checks,
+    }
+    if details:
+        result["details"] = details
+    return result
+
+
+def _security_test_telemetry(request: SecurityTestRequest) -> Dict[str, Any]:
+    source = request.telemetry or SecurityTelemetryRequest()
+    return {
+        "device_id": source.device_id,
+        "rpm": source.rpm,
+        "egt": source.egt,
+        "cht": source.cht,
+        "oil_pressure": source.oil_pressure,
+        "vibration": source.vibration,
+    }
+
+
+def _run_security_test(test_type: str, request: SecurityTestRequest) -> Dict[str, Any]:
+    telemetry = _security_test_telemetry(request)
+    device_id = telemetry["device_id"]
+
+    if test_type == "valid":
+        result = run_secure_telemetry_test(
+            telemetry=telemetry,
+            device_id=device_id,
+            sequence_number=get_next_security_sequence(),
+        )
+        status = result.get("status", "REJECTED")
+        checks = result.get("security", {})
+        passed = status == "ACCEPTED"
+        return _security_test_result(
+            "valid",
+            status,
+            passed,
+            "Valid telemetry was accepted." if passed else result.get("message", "Valid telemetry was rejected."),
+            checks,
+            {"metadata": result.get("metadata")},
+        )
+
+    if test_type == "unknown_device":
+        unknown_device = "UAV-ATTACKER-999"
+        message = canonical_telemetry({**telemetry, "device_id": unknown_device})
+        result = authenticate_device(
+            unknown_device,
+            message,
+            "invalid-signature",
+        )
+        rejected = not result.get("authenticated", False)
+        return _security_test_result(
+            "unknown_device",
+            "REJECTED" if rejected else "ACCEPTED",
+            rejected,
+            "Unauthorised device telemetry was rejected." if rejected else "Unknown device was accepted.",
+            {
+                "device_authentication": "FAIL" if rejected else "PASS",
+                "encryption_integrity": "NOT RUN",
+                "replay_protection": "NOT RUN",
+            },
+            {"device_id": unknown_device, "reason": result.get("reason")},
+        )
+
+    if test_type == "replay":
+        protector = ReplayProtector()
+        timestamp = time.time()
+        sequence_number = get_next_security_sequence()
+        first = protector.validate_packet(device_id, sequence_number, timestamp)
+        second = protector.validate_packet(device_id, sequence_number, timestamp)
+        rejected = first.get("accepted", False) and not second.get("accepted", False)
+        return _security_test_result(
+            "replay",
+            "REJECTED" if not second.get("accepted", False) else "ACCEPTED",
+            rejected,
+            "Previously accepted telemetry was rejected when replayed." if rejected else "Replay packet was accepted.",
+            {
+                "device_authentication": "PASS",
+                "encryption_integrity": "PASS",
+                "replay_protection": "PASS" if rejected else "FAIL",
+            },
+            {"original_packet": first.get("status"), "repeated_packet": second.get("status")},
+        )
+
+    if test_type == "tampering":
+        session_key = establish_hybrid_session()
+        if session_key is None:
+            raise RuntimeError("Hybrid key establishment is unavailable.")
+
+        message = canonical_telemetry(telemetry)
+        signature = generate_device_signature(device_id, message)
+        auth_result = authenticate_device(device_id, message, signature)
+        metadata = {
+            "device_id": device_id,
+            "sequence_number": get_next_security_sequence(),
+            "timestamp": time.time(),
+        }
+        associated_data = json.dumps(metadata, sort_keys=True)
+        encrypted = encrypt_telemetry(message, session_key, associated_data)
+        ciphertext = bytearray(base64.b64decode(encrypted["ciphertext"]))
+        ciphertext[0] ^= 1
+        encrypted["ciphertext"] = base64.b64encode(bytes(ciphertext)).decode()
+
+        rejected = False
+        try:
+            decrypt_telemetry(encrypted, session_key, associated_data)
+        except Exception:
+            rejected = True
+
+        return _security_test_result(
+            "tampering",
+            "REJECTED" if rejected else "ACCEPTED",
+            bool(auth_result.get("authenticated")) and rejected,
+            "Tampered telemetry was rejected successfully." if rejected else "Tampered telemetry was accepted.",
+            {
+                "device_authentication": "PASS" if auth_result.get("authenticated") else "FAIL",
+                "encryption_integrity": "PASS" if rejected else "FAIL",
+                "replay_protection": "NOT RUN",
+            },
+            {"original_egt": telemetry["egt"], "tampered_egt": 950},
+        )
+
+    raise ValueError(f"Unsupported security test: {test_type}")
+
+
+@app.post("/security/test")
+def security_test(request: SecurityTestRequest):
+    test_type = request.test_type.strip().lower()
+    supported = {"valid", "tampering", "replay", "unknown_device"}
+
+    if test_type == "all":
+        results = []
+        for name in ("valid", "tampering", "replay", "unknown_device"):
+            try:
+                results.append(_run_security_test(name, request))
+            except Exception as error:
+                results.append(_security_test_result(
+                    name,
+                    "ERROR",
+                    False,
+                    "Security test could not be completed.",
+                    {"error": str(error)},
+                ))
+        return {
+            "test": "all",
+            "status": "PASSED" if all(item["passed"] for item in results) else "FAILED",
+            "passed": all(item["passed"] for item in results),
+            "message": "All security tests passed." if all(item["passed"] for item in results) else "One or more security tests failed.",
+            "results": results,
+        }
+
+    if test_type not in supported:
+        return {
+            "test": test_type,
+            "status": "ERROR",
+            "passed": False,
+            "message": f"Unsupported test type. Choose one of: {', '.join(sorted(supported))}.",
+            "checks": {},
+        }
+
+    try:
+        return _run_security_test(test_type, request)
+    except Exception as error:
+        print(f"Security test {test_type} failed: {error}")
+        return _security_test_result(
+            test_type,
+            "ERROR",
+            False,
+            "Security backend unavailable.",
+            {"error": str(error)},
+        )
 
 
 # ============================================================
@@ -574,6 +792,13 @@ def security_status():
         ],
 
         "prototype": True,
+
+        "available_tests": [
+            "valid",
+            "tampering",
+            "replay",
+            "unknown_device",
+        ],
 
         "note": (
             "This is a prototype security demonstration. "

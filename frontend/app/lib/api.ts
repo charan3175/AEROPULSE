@@ -17,7 +17,7 @@ export type TelemetryResponse = {
   telemetry: EngineTelemetry[];
 };
 
-const API_BASE_URL = "http://127.0.0.1:8001";
+const API_BASE_URL = "http://127.0.0.1:8003";
 
 export async function getEngineHistory(
   limit: number = 50

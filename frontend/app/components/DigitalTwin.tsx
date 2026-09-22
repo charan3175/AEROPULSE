@@ -324,13 +324,6 @@ export default function DigitalTwin({
         </span>
       </div>
 
-      {/* Sensor labels */}
-      <SensorLabel label="RPM" value={rpm ? rpm.toFixed(0) : "--"} top="76px" left="12px" />
-      <SensorLabel label="EGT" value={egt !== undefined ? egt.toFixed(1) : "--"} unit="°C" top="118px" left="12px" />
-      <SensorLabel label="CHT" value={cht !== undefined ? cht.toFixed(1) : "--"} unit="°C" top="160px" left="12px" />
-      <SensorLabel label="OIL PRESSURE" value={oilPressure !== undefined ? oilPressure.toFixed(2) : "--"} unit="bar" top="202px" left="12px" />
-      <SensorLabel label="VIBRATION" value={vibration !== undefined ? vibration.toFixed(2) : "--"} unit="mm/s" top="244px" left="12px" />
-
       <div
         style={{
           position: "absolute",

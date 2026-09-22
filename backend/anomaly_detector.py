@@ -1,3 +1,6 @@
+import math
+
+
 FEATURES = [
     "rpm",
     "egt",
@@ -8,6 +11,56 @@ FEATURES = [
     "fuel_flow",
     "throttle",
 ]
+
+
+def _fallback_anomaly_result(history):
+    rows = []
+    for item in history:
+        try:
+            rows.append([float(item[feature]) for feature in FEATURES])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(rows) < 15:
+        return {
+            "status": "INSUFFICIENT DATA",
+            "anomaly": False,
+            "anomaly_score": 0,
+            "confidence": 0,
+            "severity": "UNKNOWN",
+            "message": "Not enough valid telemetry samples for anomaly detection.",
+            "samples_analyzed": len(rows),
+            "features_used": FEATURES,
+        }
+
+    means = [sum(row[index] for row in rows) / len(rows) for index in range(len(FEATURES))]
+    deviations = []
+    latest = rows[-1]
+
+    for index, mean in enumerate(means):
+        variance = sum((row[index] - mean) ** 2 for row in rows) / len(rows)
+        scale = math.sqrt(variance) or 1.0
+        deviations.append(abs(latest[index] - mean) / scale)
+
+    anomaly_score = round(min(100, sum(deviations) / len(deviations) * 18), 1)
+    anomaly = anomaly_score >= 75
+    severity = "CRITICAL" if anomaly_score >= 75 else "MEDIUM" if anomaly_score >= 50 else "LOW"
+
+    return {
+        "status": "ANOMALY DETECTED" if anomaly else "NORMAL",
+        "anomaly": anomaly,
+        "anomaly_score": anomaly_score,
+        "confidence": 80 if anomaly else 60,
+        "severity": severity,
+        "message": (
+            "Engine behaviour shows a strong deviation from recent telemetry."
+            if anomaly
+            else "Engine behaviour is consistent with recent telemetry."
+        ),
+        "samples_analyzed": len(rows),
+        "features_used": FEATURES,
+        "model": "STATISTICAL FALLBACK",
+    }
 
 
 def detect_anomalies(history):
@@ -177,6 +230,8 @@ def detect_anomalies(history):
             "features_used": FEATURES,
         }
 
+    except ImportError:
+        return _fallback_anomaly_result(history)
     except Exception as error:
         return {
             "status": "ANOMALY DETECTION ERROR",

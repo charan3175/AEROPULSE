@@ -427,7 +427,19 @@ def calculate_fuzzy_health(engine_data):
         )
 
         if clearly_normal:
-            health = max(health, 85.0)
+            # Preserve normal operation while allowing live sensor changes
+            # to produce visible health movement between samples.
+            normal_health = (
+                88.0
+                + (680.0 - egt_value) * 0.04
+                + (oil_pressure_value - 4.2) * 2.0
+                - abs(oil_temperature_value - 90.0) * 0.08
+                - max(0.0, vibration_value - 1.8) * 2.0
+            )
+            health = round(
+                max(82.0, min(94.0, normal_health)),
+                1
+            )
 
         # -------------------------------------------------
         # DETERMINE STATUS
